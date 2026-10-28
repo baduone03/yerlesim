@@ -250,3 +250,27 @@ def test_top_load_limit_propagates_down_the_stack():
     p = plan(v, [base, top])
     assert len(p.placements) == 3 and p.is_valid
     assert len(p.unplaced) == 1 and "istif" in p.unplaced[0].reason.lower()
+
+
+def test_segregation_groups_not_stacked_and_separated():
+    v = box_vehicle(L=400, W=100, H=200, payload=5000)
+    food = item("GIDA", qty=2, L=100, W=100, H=50, kg=20, segregation_group="Gıda", max_top_load=500)
+    chem = item("DET", qty=2, L=100, W=100, H=50, kg=20, segregation_group="kimyasal", max_top_load=500)
+    rules = Rules(incompatible=(("gıda", "kimyasal"),), separation_cm=50)
+    p = plan(v, [food, chem], rules)
+    assert len(p.placements) == 4 and p.is_valid, (p.errors, p.unplaced)
+    f = [x for x in p.placements if x.item.code == "GIDA"]
+    c = [x for x in p.placements if x.item.code == "DET"]
+    gap = min(max(b.x - a.x1, a.x - b.x1) for a in f for b in c)
+    assert gap >= 50
+
+    # Mesafe sağlanamıyorsa yük yerleşmez ve nedeni ayrım kuralıdır.
+    short = box_vehicle(L=220, W=100, H=200, payload=5000)
+    p2 = plan(short, [item("GIDA", L=100, W=100, H=50, segregation_group="gıda"),
+                      item("DET", L=100, W=100, H=50, segregation_group="kimyasal")], rules)
+    assert len(p2.placements) == 1 and "ayrım" in p2.unplaced[0].reason.lower()
+
+    # Elle verilen ihlal doğrulamada yakalanır (üst üste).
+    stacked = [Placement("G#1", food, 0, 0, 0, 100, 100, 50, "", 0),
+               Placement("D#1", chem, 0, 0, 50, 100, 100, 50, "", 0)]
+    assert any(x.category == "AYRIM" for x in verify_plan(v, stacked, Rules(incompatible=(("gıda", "kimyasal"),)))[0])

@@ -33,6 +33,7 @@ from .constraints import (
     support_ok,
     unload_rank,
     verify_plan,
+    segregation_conflict_mask,
     zone_arrays,
 )
 from .models import (
@@ -155,12 +156,21 @@ class _Packer:
         return sorted(self.points, key=lambda p: (p[0], p[2], p[1]))
 
     # -- kontroller ------------------------------------------------------------
-    def _check(self, item: CargoItem, rank: float, b, relax_access=False, relax_stack=False) -> tuple[bool, str, list]:
+    def _incompat_mask(self, item: CargoItem) -> np.ndarray:
+        return np.array([self.rules.are_incompatible(item, p.item) for p in self.placed], dtype=bool)
+
+    def _check(self, item: CargoItem, rank: float, b, relax_access=False, relax_stack=False,
+               relax_seg=False, incompat=None) -> tuple[bool, str, list]:
         v = self.v
         if b[3] > v.length + EPS or b[4] > v.width + EPS or b[5] > v.height + EPS:
             return False, "sinir", []
         if boxes_overlap_mask(self.boxes, b).any() or boxes_overlap_mask(self.zones, b).any():
             return False, "cakisma", []
+        if not relax_seg:
+            if incompat is None:
+                incompat = self._incompat_mask(item)
+            if incompat.any() and segregation_conflict_mask(self.boxes[incompat], b, self.rules.separation_cm).any():
+                return False, "ayrim", []
         supp: list[tuple[int, float]] = []
         if b[2] > EPS:
             ok, areas, _ = support_ok(self.boxes, b, self.rules.min_support_ratio)
@@ -257,9 +267,20 @@ class _Packer:
             key = lambda o: (o[2], -o[0], o[1])
         return sorted(ors, key=key)
 
-    def find_position(self, item: CargoItem, rank: float, relax_access=False, relax_stack=False):
+    def find_position(self, item: CargoItem, rank: float, relax_access=False, relax_stack=False, relax_seg=False):
         ors = self._orientations(item)
+        incompat = self._incompat_mask(item)
         pts = self._sorted_points()
+        sep = self.rules.separation_cm
+        if sep > EPS and incompat.any() and not relax_seg:
+            # Ayrım mesafesi kadar öteye geçici aday noktalar (normal noktalar kutu yüzeylerindedir).
+            extra = set()
+            for bx in self.boxes[incompat]:
+                for p in ((bx[3] + sep, bx[1], 0.0), (bx[3] + sep, 0.0, 0.0), (bx[0], bx[4] + sep, 0.0), (0.0, bx[4] + sep, 0.0)):
+                    if p[0] < self.v.length - EPS and p[1] < self.v.width - EPS:
+                        extra.add((round(p[0], 4), round(p[1], 4), 0.0))
+            key = (lambda q: (q[1], q[2], q[0])) if self.st.fill == "serit" else (lambda q: (q[0], q[2], q[1]))
+            pts = sorted(set(pts) | extra, key=key)
         if not pts:
             return None
         P = np.array(pts, dtype=float)
@@ -310,7 +331,7 @@ class _Packer:
             for k in np.nonzero(cand[i])[0]:
                 dx, dy, dz, label = ors[k]
                 b = (px, py, pz, px + dx, py + dy, pz + dz)
-                ok, _, supp = self._check(item, rank, b, relax_access, relax_stack)
+                ok, _, supp = self._check(item, rank, b, relax_access, relax_stack, relax_seg, incompat)
                 if ok:
                     return b, label, supp
         return None
@@ -408,6 +429,9 @@ NO_SPACE = "Araçta bu yük için yeterli ve desteklenen boş alan kalmadı (yü
 
 
 def _diagnose(pk: _Packer, item: CargoItem, rank: float) -> str:
+    if pk.rules.incompatible and pk.find_position(item, rank, relax_seg=True) is not None:
+        return (f"Boş alan var ancak ayrım kuralı ('{item.segregation_group}' grubu, uyumsuz yüklerle en az "
+                f"{pk.rules.separation_cm:.0f} cm mesafe ve istif yasağı) nedeniyle kullanılamıyor.")
     if pk.find_position(item, rank, relax_access=True) is not None:
         return ("Boş alan var ancak orada boşaltma sırası/kapı erişimi bozuluyor "
                 "(daha geç boşaltılacak yükler önünü kapatıyor).")

@@ -36,3 +36,28 @@ def test_items_survive_page_reload_via_url():
     fresh.run()
     assert not fresh.exception
     assert [i.code for i in fresh.session_state["items"]] == ["PLT-A", "PLT-B", "KOL-1", "SND-1"]
+
+
+def test_manual_edit_and_pdf_flow():
+    at = AppTest.from_file(APP, default_timeout=180).run()
+    next(b for b in at.button if b.label == "Örnek yük listesini yükle").click().run()
+    next(b for b in at.button if "Yerleşimi hesapla" in b.label).click().run()
+    fleet = at.session_state["results"][0]
+    assert fleet.metrics["error_count"] == 0
+    # Yer değiştir: iki farklı duraktaki yük
+    at.radio(key="op_0").set_value("Yer değiştir").run()
+    a = next(p.uid for p in fleet.plans[0].placements if p.item.code == "SND-1")
+    b = next(p.uid for p in fleet.plans[0].placements if p.item.code == "PLT-B")
+    at.selectbox(key="sw_a_0_0").set_value(a).run()
+    at.selectbox(key="sw_b_0_0").set_value(b).run()
+    next(x for x in at.button if x.label == "Yer değiştir").click().run()
+    assert not at.exception
+    fleet = at.session_state["results"][0]
+    assert fleet.metrics["manual_edits"] == 1 and fleet.metrics["error_count"] > 0
+    # Geri al
+    next(x for x in at.button if "Otomatik plana geri dön" in x.label).click().run()
+    assert at.session_state["results"][0].metrics["error_count"] == 0
+    # PDF
+    next(x for x in at.button if "PDF'ini hazırla" in x.label).click().run()
+    assert not at.exception
+    assert at.session_state["pdf_cache"][1][:5] == b"%PDF-"

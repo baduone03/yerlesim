@@ -30,7 +30,9 @@ from loadplanner.models import (
     Vehicle,
     Zone,
 )
+from loadplanner.manual import add_unplaced, move_placement, remove_placement, suggest_position, swap_placements
 from loadplanner.optimizer import compare_vehicles
+from loadplanner.pdf_report import build_loading_pdf
 from loadplanner.state_codec import decode_state, encode_state
 from loadplanner.validation import validate_items, validate_vehicle
 from loadplanner.vehicle_data import default_vehicles, get_default_vehicle
@@ -258,6 +260,9 @@ def item_fields(prefix: str, it: CargoItem) -> dict:
     d["loading_priority"] = c2.number_input("Yükleme önceliği (1 = ilk yüklenen)", min_value=1, step=1,
                                             value=int(it.loading_priority), key=f"{prefix}_prio")
     d["notes"] = st.text_input("Sabitleme / taşıma notları", it.notes, key=f"{prefix}_notes")
+    d["segregation_group"] = st.text_input(
+        "Ayrım grubu (isteğe bağlı, ör. gıda, kimyasal)", it.segregation_group, key=f"{prefix}_seg",
+        help="Hangi grupların birlikte taşınamayacağı 'Kurallar' sekmesinde tanımlanır.")
     d["code"] = d["code"].strip()
     d["name"] = d["name"].strip() or d["code"]
     return d
@@ -337,7 +342,7 @@ def items_tab() -> None:
                         rec = {k: (None if (k == "max_top_load" and pd.isna(v)) else v) for k, v in r.to_dict().items()}
                         for k in ("quantity", "delivery_stop", "loading_priority"):
                             rec[k] = int(rec[k])
-                        for k in ("code", "name", "notes"):
+                        for k in ("code", "name", "notes", "segregation_group"):
                             rec[k] = "" if pd.isna(rec[k]) else str(rec[k])
                         new_items.append(CargoItem(**rec))
                     except (TypeError, ValueError) as e:
@@ -398,7 +403,33 @@ def rules_tab() -> None:
     sup = st.slider("Üstteki yük için asgari taban desteği (%)", 50, 100, int(r.min_support_ratio * 100), 5)
     clear = st.number_input("Arka kapı önünde boş bırakılacak mesafe (cm)", min_value=0.0, value=float(r.rear_clearance_cm), step=10.0)
     st.caption("Kapı tanımları (arka/yan kapı) ve yasak bölgeler 'Araç Seçimi' sekmesinde araç profiline göre girilir.")
-    new = Rules(mode=mode, allow_mixed_stop_stacking=mixed, min_support_ratio=sup / 100, rear_clearance_cm=clear)
+
+    st.markdown("#### Birlikte taşınamaz yük grupları")
+    st.caption("Yüklere 'Ayrım grubu' verin (ör. gıda, kimyasal). Burada eşleştirilen gruplar üst üste konulmaz "
+               "ve aralarında en az aşağıdaki yatay mesafe bırakılır. Her satıra bir çift yazın: gıda, kimyasal")
+    groups = sorted({i.segregation_group.strip() for i in st.session_state["items"] if i.segregation_group.strip()})
+    if groups:
+        st.caption("Listedeki gruplar: " + ", ".join(groups))
+    pairs_text = st.text_area("Uyumsuz grup çiftleri", "\n".join(f"{a}, {b}" for a, b in r.incompatible),
+                              placeholder="gıda, kimyasal")
+    sep = st.number_input("Uyumsuz yükler arasında en az yatay mesafe (cm)", min_value=0.0,
+                          value=float(r.separation_cm), step=10.0)
+    if pairs_text.strip() and sep == 0:
+        st.caption("Mesafe 0 cm: uyumsuz yükler yalnızca üst üste konmaz, yan yana bitişik durabilir. "
+                   "Aralarında boşluk istiyorsanız mesafe girin (ör. 50 cm).")
+    pairs, bad_lines = [], []
+    for line in pairs_text.splitlines():
+        if not line.strip():
+            continue
+        parts = [x.strip() for x in line.replace(";", ",").split(",") if x.strip()]
+        if len(parts) == 2 and parts[0].lower() != parts[1].lower():
+            pairs.append(tuple(parts))
+        else:
+            bad_lines.append(line)
+    for line in bad_lines:
+        st.error(f"Anlaşılamayan satır: '{line}'. Biçim: grup1, grup2")
+    new = Rules(mode=mode, allow_mixed_stop_stacking=mixed, min_support_ratio=sup / 100, rear_clearance_cm=clear,
+                incompatible=tuple(pairs), separation_cm=sep)
     if new != r:
         st.session_state["rules"] = new
         st.rerun()
@@ -448,6 +479,7 @@ def optimize_tab() -> None:
             res = compare_vehicles([copy.deepcopy(vehicles[v]) for v in sel], ss["items"], ss["rules"],
                                    objective=obj, max_vehicles=int(max_n), depth=depth)
         ss["results"] = res
+        ss["results_original"] = copy.deepcopy(res)
         ss["result_sig"] = signature()
         ss["view_idx"] = 0
 
@@ -529,6 +561,104 @@ def view_tab() -> None:
             st.plotly_chart(figure_2d(plan, rules, vw, step, color_by), width="stretch")
     st.markdown("#### Yük koordinatları")
     st.dataframe(placements_dataframe(plan), hide_index=True, width="stretch")
+    manual_edit_panel(fleet, k)
+
+
+def _after_edit(fleet, k: int, what: str) -> None:
+    plan = fleet.plans[k]
+    if plan.errors:
+        flash(f"{what} Planda şimdi {len(plan.errors)} ihlal var; kırmızı yükleri ve raporu kontrol edin.", "warning")
+    else:
+        flash(f"{what} Yeniden kontrol edildi: ihlal yok.")
+    st.rerun()
+
+
+def manual_edit_panel(fleet, k: int) -> None:
+    ss = st.session_state
+    rules = ss["rules"]
+    plan = fleet.plans[k]
+    edits = fleet.metrics.get("manual_edits", 0)
+    with st.expander("✏️ Yerleşimi elle düzenle", expanded=False):
+        st.caption("Her değişiklikten sonra plan baştan kontrol edilir (çakışma, sınır, destek, istif, ayrım, "
+                   "erişim). Hatalı değişiklik engellenmez, ihlal olarak gösterilir. Koordinatlar cm; "
+                   "X=0 kabin tarafı, Y=0 sol duvar, Z=0 taban.")
+        if edits:
+            st.info(f"Bu planda {edits} elle değişiklik var.")
+            if st.button("↩️ Otomatik plana geri dön", key=f"reset_{k}"):
+                orig = ss.get("results_original")
+                idx = ss.get("view_idx", 0)
+                if orig:
+                    ss["results"][idx] = copy.deepcopy(orig[idx])
+                    flash("Otomatik plana geri dönüldü.", "info")
+                    st.rerun()
+        op = st.radio("İşlem", ["Taşı / döndür", "Yer değiştir", "Araçtan çıkar", "Yerleşmeyen yükü ekle"],
+                      key=f"op_{k}", horizontal=True)
+        pls = sorted(plan.placements, key=lambda p: p.load_step)
+        label = {p.uid: f"{p.uid} - {p.item.name} (X{p.x:.0f} Y{p.y:.0f} Z{p.z:.0f})" for p in pls}
+        sfx = f"{k}_{edits}"
+
+        if op == "Taşı / döndür" and pls:
+            uid = st.selectbox("Yük", [p.uid for p in pls], format_func=label.get, key=f"mv_uid_{sfx}")
+            p = next(q for q in pls if q.uid == uid)
+            ors = [o[3] for o in p.item.orientations()]
+            ori = st.selectbox("Yönelim", ors, index=ors.index(p.orientation) if p.orientation in ors else 0,
+                               key=f"mv_or_{sfx}_{uid}")
+            c1, c2, c3 = st.columns(3)
+            x = c1.number_input("X (cm)", value=float(p.x), step=10.0, key=f"mv_x_{sfx}_{uid}")
+            y = c2.number_input("Y (cm)", value=float(p.y), step=10.0, key=f"mv_y_{sfx}_{uid}")
+            z = c3.number_input("Z (cm)", value=float(p.z), step=10.0, key=f"mv_z_{sfx}_{uid}")
+            c1, c2 = st.columns(2)
+            if c1.button("Uygula", type="primary", key=f"mv_go_{sfx}"):
+                move_placement(fleet, k, uid, x, y, z, ori, rules)
+                _after_edit(fleet, k, f"{uid} taşındı.")
+            if c2.button("Kurallara uygun ilk konuma taşı", key=f"mv_auto_{sfx}"):
+                pos = suggest_position(plan, p.item, rules, exclude_uid=uid)
+                if pos is None:
+                    st.error("Bu yük için mevcut yerleşimi bozmadan kurallara uygun bir konum bulunamadı.")
+                else:
+                    move_placement(fleet, k, uid, pos[0], pos[1], pos[2], pos[3], rules)
+                    _after_edit(fleet, k, f"{uid} önerilen konuma taşındı.")
+
+        elif op == "Yer değiştir" and len(pls) >= 2:
+            ids = [p.uid for p in pls]
+            a = st.selectbox("1. yük", ids, format_func=label.get, key=f"sw_a_{sfx}")
+            b = st.selectbox("2. yük", [i for i in ids if i != a], format_func=label.get, key=f"sw_b_{sfx}")
+            st.caption("Yükler birbirinin köşe konumuna geçer; her yük kendi ölçüsünü korur.")
+            if st.button("Yer değiştir", type="primary", key=f"sw_go_{sfx}"):
+                swap_placements(fleet, k, a, b, rules)
+                _after_edit(fleet, k, f"{a} ile {b} yer değiştirdi.")
+
+        elif op == "Araçtan çıkar" and pls:
+            uid = st.selectbox("Yük", [p.uid for p in pls], format_func=label.get, key=f"rm_uid_{sfx}")
+            if st.button("Araçtan çıkar", type="primary", key=f"rm_go_{sfx}"):
+                remove_placement(fleet, k, uid, rules)
+                _after_edit(fleet, k, f"{uid} araçtan çıkarıldı ve 'yerleştirilemeyen' listesine alındı.")
+
+        elif op == "Yerleşmeyen yükü ekle":
+            if not fleet.unplaced:
+                st.info("Yerleştirilemeyen yük yok.")
+                return
+            umap = {u.uid: u for u in fleet.unplaced}
+            uid = st.selectbox("Yük", list(umap), format_func=lambda i: f"{i} - {umap[i].item.name}", key=f"ad_uid_{sfx}")
+            u = umap[uid]
+            st.caption(f"Neden yerleşmemişti: {u.reason}")
+            if st.button("Kurallara uygun ilk konuma ekle", type="primary", key=f"ad_auto_{sfx}"):
+                pos = suggest_position(plan, u.item, rules)
+                if pos is None:
+                    st.error("Bu araçta mevcut yerleşimi bozmadan kurallara uygun bir konum yok.")
+                else:
+                    add_unplaced(fleet, k, uid, pos[0], pos[1], pos[2], pos[3], rules)
+                    _after_edit(fleet, k, f"{uid} araca eklendi.")
+            st.markdown("veya konumu kendiniz girin:")
+            ors = [o[3] for o in u.item.orientations()]
+            ori = st.selectbox("Yönelim", ors, key=f"ad_or_{sfx}_{uid}")
+            c1, c2, c3 = st.columns(3)
+            x = c1.number_input("X (cm)", value=0.0, step=10.0, key=f"ad_x_{sfx}_{uid}")
+            y = c2.number_input("Y (cm)", value=0.0, step=10.0, key=f"ad_y_{sfx}_{uid}")
+            z = c3.number_input("Z (cm)", value=0.0, step=10.0, key=f"ad_z_{sfx}_{uid}")
+            if st.button("Bu konuma ekle", key=f"ad_go_{sfx}"):
+                add_unplaced(fleet, k, uid, x, y, z, ori, rules)
+                _after_edit(fleet, k, f"{uid} araca eklendi.")
 
 
 # ----------------------------------------------------------------------------
@@ -544,6 +674,9 @@ def report_tab() -> None:
     st.subheader("Sonuç raporu")
     if ss["result_sig"] != signature():
         st.warning("Girdiler değişti; rapor son hesaplamaya aittir.")
+    if fleet.metrics.get("manual_edits"):
+        st.info(f"Bu plan elle düzenlendi ({fleet.metrics['manual_edits']} değişiklik); aşağıdaki değerler "
+                "düzenlenmiş plana göredir.")
     if fleet is ss["results"][0]:
         st.markdown(f"**Seçilen araç ve neden:** {fleet.explanation}")
     else:
@@ -622,8 +755,28 @@ def export_tab() -> None:
     fleet = current_fleet()
     if fleet is None:
         return
+    st.markdown("**Yükleme talimatı (PDF)** - şoför / depo için: kontrol durumu, adım numaralı üstten ve yandan "
+                "çizim, adım adım yükleme listesi, durak bazında boşaltma, özel uyarılar. Telefondan paylaşılabilir.")
+    if fleet.metrics.get("error_count"):
+        st.warning("Bu planda kural ihlali var; PDF'in ilk sayfasında kırmızı uyarı olarak yazılır.")
+    # PDF her yeniden çalıştırmada değil, istenince üretilir; plan değişirse önbellek geçersiz olur.
+    key = (ss["result_sig"], ss.get("view_idx", 0), fleet.metrics.get("manual_edits", 0),
+           repr(ss["rules"]), fleet.metrics.get("error_count", 0), id(fleet))
+    cached = ss.get("pdf_cache")
+    if cached and cached[0] == key:
+        st.download_button("📄 Yükleme talimatını indir (PDF)", cached[1], "yukleme_talimati.pdf", "application/pdf",
+                           type="primary")
+    elif st.button("📄 Yükleme talimatı PDF'ini hazırla", type="primary"):
+        try:
+            with st.spinner("PDF hazırlanıyor..."):
+                ss["pdf_cache"] = (key, build_loading_pdf(fleet, ss["rules"]))
+        except Exception as e:  # PDF üretimi uygulamanın geri kalanını durdurmamalı
+            st.error(f"PDF oluşturulamadı: {e}")
+        else:
+            st.rerun()
+    st.markdown("**Veri dosyaları**")
     st.download_button("Yerleşim planı ve yük koordinatları (CSV)", fleet_placements_csv(fleet).encode("utf-8-sig"),
-                       "yerlesim_plani.csv", "text/csv", type="primary")
+                       "yerlesim_plani.csv", "text/csv")
     if fleet.unplaced:
         st.download_button("Yerleştirilemeyen yükler (CSV)", unplaced_csv(fleet).encode("utf-8-sig"),
                            "yerlesmeyen_yukler.csv", "text/csv")

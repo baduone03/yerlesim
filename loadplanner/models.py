@@ -40,6 +40,12 @@ OBJECTIVES = {
 }
 
 
+def normalize_group(name: str) -> str:
+    """Ayrım grubu adını karşılaştırma için normalleştirir (Türkçe küçük harf)."""
+    s = str(name or "").strip().replace("I", "ı").replace("İ", "i")
+    return " ".join(s.lower().split())
+
+
 @dataclass
 class Door:
     """Araç erişim kapısı.
@@ -160,6 +166,11 @@ class CargoItem:
     delivery_stop: int = 1
     loading_priority: int = 1
     notes: str = ""
+    segregation_group: str = ""  # ör. "gıda", "kimyasal"; Rules.incompatible ile birlikte kullanılır
+
+    @property
+    def group_key(self) -> str:
+        return normalize_group(self.segregation_group)
 
     @property
     def unit_volume_cm3(self) -> float:
@@ -203,6 +214,24 @@ class Rules:
     allow_mixed_stop_stacking: bool = False
     min_support_ratio: float = 0.75
     rear_clearance_cm: float = 0.0
+    # Birlikte istiflenemeyen ve arasında en az ``separation_cm`` yatay mesafe
+    # bırakılması gereken ayrım grubu çiftleri, ör. (("gıda", "kimyasal"),).
+    incompatible: tuple = ()
+    separation_cm: float = 0.0
+
+    def __post_init__(self) -> None:
+        pairs = set()
+        for pair in self.incompatible:
+            a, b = (normalize_group(x) for x in pair)
+            if a and b and a != b:
+                pairs.add(tuple(sorted((a, b))))
+        self.incompatible = tuple(sorted(pairs))
+
+    def are_incompatible(self, a: CargoItem, b: CargoItem) -> bool:
+        ga, gb = a.group_key, b.group_key
+        if not ga or not gb or ga == gb:
+            return False
+        return tuple(sorted((ga, gb))) in self.incompatible
 
 
 @dataclass

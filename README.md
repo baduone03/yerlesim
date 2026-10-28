@@ -50,7 +50,26 @@ python -m pytest
    kaydırıcısı, koordinat tablosu. İhlalli yükler kırmızı vurgulanır.
 6. **Rapor**: Seçilen araç ve nedeni, toplam adet/ağırlık/hacim, hacim ve ağırlık kullanım
    oranları, ihlaller, uyarılar, yükleme/boşaltma sırası, yerleştirilemeyen yükler.
-7. **Dışa Aktar**: Yerleşim planı + koordinatlar CSV, yerleştirilemeyen yükler CSV, yük listesi CSV.
+7. **Dışa Aktar**: **Yükleme talimatı PDF** (şoför/depo için; kontrol durumu, adım numaralı üstten ve
+   yandan çizim, adım adım yükleme listesi, durak bazında boşaltma, özel uyarılar), yerleşim planı +
+   koordinatlar CSV, yerleştirilemeyen yükler CSV, yük listesi CSV.
+
+Girdiler (yük listesi, kurallar, değiştirilmiş araç profilleri) sayfa adresine sıkıştırılarak yazılır;
+sayfa yenilenince geri yüklenir ve bağlantı paylaşılabilir. Hesaplama sonuçları saklanmaz.
+
+### Elle düzenleme
+
+3D Yerleşim sekmesindeki "Yerleşimi elle düzenle" bölümünden bir yük taşınabilir/döndürülebilir, iki yük
+yer değiştirebilir, yük araçtan çıkarılabilir veya yerleşmeyen bir yük eklenebilir ("kurallara uygun ilk
+konum" önerisiyle ya da koordinat girerek). Her değişiklikten sonra plan baştan doğrulanır; hatalı
+değişiklik engellenmez, ihlal olarak gösterilir. "Otomatik plana geri dön" ile değişiklikler geri alınır.
+
+### Birlikte taşınamaz yükler (ayrım grupları)
+
+Yüklere "ayrım grubu" (ör. `gıda`, `kimyasal`) verilir; Kurallar sekmesinde uyumsuz çiftler
+(`gıda, kimyasal`) ve aralarındaki asgari yatay mesafe tanımlanır. Uyumsuz yükler hiçbir zaman üst üste
+konmaz ve aralarındaki yatay (XY) mesafe bu değerden az olamaz. 0 cm'de yan yana temas serbesttir.
+Bu kural bir mevzuat (ör. ADR) uyumluluk kontrolü değildir; ayrım ihtiyacını kullanıcı tanımlar.
 
 Örnek veri: `examples/ornek_yukler.csv` (arayüzde "Örnek yük listesini yükle").
 
@@ -60,7 +79,7 @@ Ayırıcı `;` veya `,`; ondalık virgül desteklenir; UTF-8 veya Windows-1254 k
 Zorunlu sütunlar: `kod, adet, boy_cm, en_cm, yukseklik_cm, birim_agirlik_kg`.
 İsteğe bağlı: `ad, tip (palet/koli/sandik/makine/rulo/ozel), palet_dahil, ustune_yuk_konabilir,
 ust_azami_yuk_kg, dondurulebilir, yan_yatirilabilir, kirilabilir, istiflenebilir, teslimat_sirasi,
-yukleme_onceligi, notlar`. Evet/hayır alanları `evet/hayır`, `1/0`, `true/false` kabul eder.
+yukleme_onceligi, notlar, ayrim_grubu`. Evet/hayır alanları `evet/hayır`, `1/0`, `true/false` kabul eder.
 Hatalı satırlar satır numarasıyla raporlanır.
 
 ## Koordinat sistemi
@@ -145,6 +164,10 @@ loadplanner/
   constraints.py            Geometri, sıra kuralları, bağımsız doğrulama, ağırlık analizi
   visualization.py          Plotly 3D ve 2D görünümler
   io_csv.py                 CSV içe/dışa aktarma
+  manual.py                 Elle düzenleme işlemleri ve yeniden doğrulama
+  pdf_report.py             Yükleme talimatı PDF'i (fpdf2)
+  state_codec.py            Girdilerin sayfa adresinde saklanması
+assets/fonts/               PDF için DejaVu Sans (Türkçe karakter desteği; lisansı klasörde)
 examples/ornek_yukler.csv   Örnek yük listesi
 tests/                      pytest testleri (algoritma, CSV, arayüz duman testi)
 ```
@@ -152,6 +175,7 @@ tests/                      pytest testleri (algoritma, CSV, arayüz duman testi
 ## Sonraki adımlar (öneri)
 
 - Karma filo ve araçlar arası teslimat durağı bazlı bölme
+- Gerçek araç verileriyle aks yükü ve kalıcı araç/plan kaydı
 - Yük sabitleme noktaları ve sabitleme önerisi
 - Gerçek araç verileriyle aks yükü (boş araç dağılımı dahil)
 - Daha güçlü arama (ör. yerel arama / genetik algoritma), silindirik yük modeli

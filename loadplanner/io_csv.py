@@ -33,6 +33,7 @@ COLUMNS = {
     "teslimat_sirasi": ("delivery_stop", int),
     "yukleme_onceligi": ("loading_priority", int),
     "notlar": ("notes", str),
+    "ayrim_grubu": ("segregation_group", str),
 }
 REQUIRED = ["kod", "adet", "boy_cm", "en_cm", "yukseklik_cm", "birim_agirlik_kg"]
 

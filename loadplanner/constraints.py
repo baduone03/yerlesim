@@ -141,6 +141,20 @@ def support_ok(arr: np.ndarray, b, min_ratio: float) -> tuple[bool, np.ndarray, 
     return True, areas, ""
 
 
+def segregation_conflict_mask(arr: np.ndarray, b, sep: float) -> np.ndarray:
+    """``arr`` içindeki kutulardan ``b`` ile ayrım kuralını bozanlar.
+
+    Kural: taban izdüşümleri üst üste gelemez (istif yok) ve iki kutu arasındaki
+    yatay (XY) mesafe ``sep`` değerinden az olamaz.
+    """
+    if arr.shape[0] == 0:
+        return np.zeros(0, dtype=bool)
+    gx = np.maximum(0.0, np.maximum(arr[:, 0] - b[3], b[0] - arr[:, 3]))
+    gy = np.maximum(0.0, np.maximum(arr[:, 1] - b[4], b[1] - arr[:, 4]))
+    footprint_overlap = overlap_1d(arr[:, 0], arr[:, 3], b[0], b[3]) & overlap_1d(arr[:, 1], arr[:, 4], b[1], b[4])
+    return footprint_overlap | (np.hypot(gx, gy) < sep - EPS)
+
+
 def door_usable(vehicle: Vehicle, door, b) -> bool:
     """Kutu bu kapıdan (kapı açıklığı ve konum olarak) geçirilebilir mi?"""
     w, h = vehicle.door_size(door)
@@ -329,6 +343,18 @@ def verify_plan(vehicle: Vehicle, placements: list[Placement], rules: Rules,
         if lim is not None and p.item.supports_load and load_on[j] > lim + 1e-6:
             v.append(Violation("İSTİF DAYANIMI", "hata",
                                f"{_label(p)} üzerine yaklaşık {load_on[j]:.0f} kg biniyor; izin verilen {lim:.0f} kg.", [p.uid]))
+
+    # 5b) Ayrım (birlikte taşınamaz yük grupları)
+    if rules.incompatible:
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, c = placements[i], placements[j]
+                if rules.are_incompatible(a.item, c.item) and segregation_conflict_mask(arr[j:j + 1], arr[i], rules.separation_cm)[0]:
+                    v.append(Violation(
+                        "AYRIM", "hata",
+                        f"{_label(a)} ('{a.item.segregation_group}') ile {_label(c)} ('{c.item.segregation_group}') "
+                        f"ayrı tutulmalı: üst üste konulamaz ve aralarında en az {rules.separation_cm:.0f} cm olmalı.",
+                        [a.uid, c.uid]))
 
     # 6) Toplam ağırlık
     total_w = float(sum(p.weight for p in placements))

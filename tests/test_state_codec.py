@@ -7,8 +7,10 @@ from loadplanner.vehicle_data import default_vehicles
 
 def test_roundtrip_items_rules_and_edited_vehicle():
     items = [CargoItem("SU", "Su paleti", "palet", 4, 120, 80, 150, 650, allow_on_top=False, delivery_stop=2),
-             CargoItem("VAZO", "Cam vazo", "koli", 6, 50, 50, 50, 8, fragile=True, max_top_load=None)]
-    rules = Rules(mode="LIFO", allow_mixed_stop_stacking=True, min_support_ratio=0.8, rear_clearance_cm=20)
+             CargoItem("VAZO", "Cam vazo", "koli", 6, 50, 50, 50, 8, fragile=True, max_top_load=None,
+                       segregation_group="gıda")]
+    rules = Rules(mode="LIFO", allow_mixed_stop_stacking=True, min_support_ratio=0.8, rear_clearance_cm=20,
+                  incompatible=(("Gıda", "kimyasal"),), separation_cm=40)
     vehicles = default_vehicles()
     vehicles["ozel"].length = 512
     vehicles["ozel"].zones.append(Zone("engel", 0, 0, 0, 10, 10, 10, True))

@@ -1,5 +1,5 @@
-kod;ad;tip;adet;boy_cm;en_cm;yukseklik_cm;birim_agirlik_kg;palet_dahil;ustune_yuk_konabilir;ust_azami_yuk_kg;dondurulebilir;yan_yatirilabilir;kirilabilir;istiflenebilir;teslimat_sirasi;yukleme_onceligi;notlar
-PLT-A;Euro palet - deterjan;palet;6;120;80;140;520;evet;evet;500;evet;hayır;hayır;evet;2;1;Spanzet ile sabitle
-PLT-B;Euro palet - cam şişe;palet;4;120;80;120;380;evet;hayır;;evet;hayır;evet;hayır;1;2;Kırılabilir, üstüne yük konmaz
-KOL-1;Koli - kuru gıda;koli;24;60;40;40;14;evet;evet;70;evet;evet;hayır;evet;1;2;
-SND-1;Ahşap sandık - yedek parça;sandik;2;100;100;80;250;evet;evet;300;evet;hayır;hayır;evet;3;1;Forklift ile
+kod;ad;tip;adet;boy_cm;en_cm;yukseklik_cm;birim_agirlik_kg;palet_dahil;ustune_yuk_konabilir;ust_azami_yuk_kg;dondurulebilir;yan_yatirilabilir;kirilabilir;istiflenebilir;teslimat_sirasi;yukleme_onceligi;notlar;ayrim_grubu
+PLT-A;Euro palet - deterjan;palet;6;120;80;140;520;evet;evet;500;evet;hayır;hayır;evet;2;1;Spanzet ile sabitle;kimyasal
+PLT-B;Euro palet - cam şişe;palet;4;120;80;120;380;evet;hayır;;evet;hayır;evet;hayır;1;2;Kırılabilir, üstüne yük konmaz;
+KOL-1;Koli - kuru gıda;koli;24;60;40;40;14;evet;evet;70;evet;evet;hayır;evet;1;2;;gıda
+SND-1;Ahşap sandık - yedek parça;sandik;2;100;100;80;250;evet;evet;300;evet;hayır;hayır;evet;3;1;Forklift ile;
