@@ -23,3 +23,16 @@ def test_app_blocks_empty_list():
     next(b for b in at.button if "Yerleşimi hesapla" in b.label).click().run()
     assert any("boş" in e.value for e in at.error)
     assert at.session_state["results"] is None
+
+
+def test_items_survive_page_reload_via_url():
+    at = AppTest.from_file(APP, default_timeout=60).run()
+    next(b for b in at.button if b.label == "Örnek yük listesini yükle").click().run()
+    saved = at.query_params["d"]
+    assert saved
+    # Yenileme: yeni oturum, aynı adres
+    fresh = AppTest.from_file(APP, default_timeout=60)
+    fresh.query_params["d"] = saved[0] if isinstance(saved, list) else saved
+    fresh.run()
+    assert not fresh.exception
+    assert [i.code for i in fresh.session_state["items"]] == ["PLT-A", "PLT-B", "KOL-1", "SND-1"]

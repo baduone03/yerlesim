@@ -31,6 +31,7 @@ from loadplanner.models import (
     Zone,
 )
 from loadplanner.optimizer import compare_vehicles
+from loadplanner.state_codec import decode_state, encode_state
 from loadplanner.validation import validate_items, validate_vehicle
 from loadplanner.vehicle_data import default_vehicles, get_default_vehicle
 from loadplanner.visualization import figure_2d, figure_3d
@@ -66,6 +67,13 @@ st.markdown(
 
 def init_state() -> None:
     ss = st.session_state
+    if "items" not in ss and "d" in st.query_params:
+        # Sayfa yenilendi veya paylaşılan bağlantı açıldı: girdileri adresten geri yükle.
+        try:
+            ss["items"], ss["rules"], ss["vehicles"] = decode_state(st.query_params["d"])
+            ss["saved_state"] = st.query_params["d"]
+        except ValueError as e:
+            ss.setdefault("flash", []).append(("warning", f"{e}. Boş liste ile başlanıyor."))
     ss.setdefault("items", [])
     ss.setdefault("vehicles", default_vehicles())
     ss.setdefault("rules", Rules())
@@ -271,6 +279,9 @@ def check_and_build(d: dict, others: list[CargoItem]) -> CargoItem | None:
 def items_tab() -> None:
     items: list[CargoItem] = st.session_state["items"]
     st.subheader(f"Yük listesi ({len(items)} satır, {sum(i.quantity for i in items)} adet)")
+    st.caption("Liste sayfa adresine otomatik kaydedilir; sayfayı yenileyince geri gelir. "
+               "Adresi yer imlerine ekleyerek veya paylaşarak listeyi saklayabilirsiniz. "
+               "Hesaplama sonuçları saklanmaz; yenilemeden sonra yeniden hesaplayın.")
 
     with st.expander("➕ Yeni yük ekle", expanded=not items):
         with st.form("add_item", clear_on_submit=False):
@@ -644,6 +655,21 @@ def main() -> None:
         report_tab()
     with tabs[6]:
         export_tab()
+    save_state_to_url()
+
+
+def save_state_to_url() -> None:
+    """Girdileri adres satırına yazar; sayfa yenilenince init_state geri yükler."""
+    ss = st.session_state
+    enc = encode_state(ss["items"], ss["rules"], ss["vehicles"])
+    if enc == ss.get("saved_state"):
+        return
+    ss["saved_state"] = enc
+    empty = encode_state([], Rules(), default_vehicles())
+    if enc == empty:
+        st.query_params.pop("d", None)
+    else:
+        st.query_params["d"] = enc
 
 
 main()
