@@ -1,6 +1,6 @@
 """LoadPlanner TR - Streamlit arayüzü.
 
-Çalıştırma:  streamlit run app.py
+Çalıştırma:  streamlit run streamlit_app.py
 """
 
 from __future__ import annotations

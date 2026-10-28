@@ -15,11 +15,11 @@ Python 3.10+ gerekir.
 
 ```bash
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 Tarayıcıda `http://localhost:8501` açılır. Aynı ağdaki telefondan erişmek için
-`streamlit run app.py --server.address 0.0.0.0` ile başlatıp bilgisayarın IP adresini kullanın.
+`streamlit run streamlit_app.py --server.address 0.0.0.0` ile başlatıp bilgisayarın IP adresini kullanın.
 
 Testler:
 
@@ -32,7 +32,7 @@ python -m pytest
 
 1. https://share.streamlit.io adresine GitHub hesabıyla giriş yapın.
 2. **Create app** → **Deploy a public app from GitHub** (veya "Yup, I have an app").
-3. Repository: `baduone03/yerlesim`, Branch: uygulamanın bulunduğu dal, Main file path: `app.py`.
+3. Repository: `baduone03/yerlesim`, Branch: uygulamanın bulunduğu dal, Main file path: `streamlit_app.py`.
 4. **Deploy**. Bağımlılıklar `requirements.txt` dosyasından kurulur; ayarlar `.streamlit/config.toml` içindedir.
 
 ## Kullanım
@@ -136,7 +136,7 @@ bilgisi girilmelidir. Demo profillerde aks yük limitleri boştur.
 ## Proje yapısı
 
 ```
-app.py                      Streamlit arayüzü (7 bölüm)
+streamlit_app.py            Streamlit arayüzü (7 bölüm)
 loadplanner/
   models.py                 Veri modelleri (araç, kapı, bölge, aks, yük, yerleşim, plan)
   vehicle_data.py           DEMO araç profilleri
