@@ -24,8 +24,16 @@ Tarayıcıda `http://localhost:8501` açılır. Aynı ağdaki telefondan erişme
 Testler:
 
 ```bash
+pip install -r requirements-dev.txt
 python -m pytest
 ```
+
+### Streamlit Community Cloud'a yükleme
+
+1. https://share.streamlit.io adresine GitHub hesabıyla giriş yapın.
+2. **Create app** → **Deploy a public app from GitHub** (veya "Yup, I have an app").
+3. Repository: `baduone03/yerlesim`, Branch: uygulamanın bulunduğu dal, Main file path: `app.py`.
+4. **Deploy**. Bağımlılıklar `requirements.txt` dosyasından kurulur; ayarlar `.streamlit/config.toml` içindedir.
 
 ## Kullanım
 
