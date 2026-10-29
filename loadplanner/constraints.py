@@ -231,6 +231,15 @@ def _weight_violations(vehicle: Vehicle, placements: list[Placement]) -> tuple[l
     if cz > 0.5 * vehicle.height:
         out.append(Violation("AĞIRLIK DAĞILIMI", "uyari",
                              f"Yük ağırlık merkezi yüksek (Z = {cz:.0f} cm). Devrilme riskini değerlendirin."))
+    total = wa["total_weight"]
+    off = cx - vehicle.length / 2
+    if total >= 0.3 * vehicle.max_payload_kg and abs(off) > 0.15 * vehicle.length:
+        where = "öne (kabine)" if off < 0 else "arkaya (kapıya)"
+        tip = (" Kurallar sekmesindeki 'Kısmi yükü kasa ortasına kaydır' seçeneğini deneyin." if off < 0 else "")
+        out.append(Violation("AĞIRLIK DAĞILIMI", "uyari",
+                             f"Yükün ağırlık merkezi kasa ortasından {abs(off):.0f} cm {where} kaymış ({total:,.0f} kg yük). "
+                             f"Kısmi ağır yükte {'ön aks / şasi pimi' if off < 0 else 'arka aks'} aşırı yüklenebilir; "
+                             f"aracın yük dağılım diyagramına göre kontrol edin.{tip}".replace(",", ".")))
     a = vehicle.axles
     if wa["axle"] is None:
         out.append(Violation("AKS", "uyari",
@@ -306,6 +315,7 @@ def verify_plan(vehicle: Vehicle, placements: list[Placement], rules: Rules,
 
     # 4) Destek, istif kuralları
     supporters: list[list[tuple[int, float]]] = [[] for _ in range(n)]
+    heavy_on_light: list[str] = []
     for i, (p, b) in enumerate(zip(placements, arr)):
         if p.z < EPS:
             continue
@@ -328,9 +338,12 @@ def verify_plan(vehicle: Vehicle, placements: list[Placement], rules: Rules,
                                    f"{_label(p)} farklı boşaltma sırasındaki {_label(s)} üzerine konulmuş (karışık istif kapalı).",
                                    [p.uid, s.uid]))
             if p.weight > s.weight * 1.5 and p.weight - s.weight > 20:
-                v.append(Violation("İSTİF", "uyari",
-                                   f"Ağır yük hafif yükün üzerinde: {_label(p)} {p.weight:.0f} kg, altındaki {_label(s)} {s.weight:.0f} kg.",
-                                   [p.uid, s.uid]))
+                heavy_on_light.append(p.uid)
+
+    if heavy_on_light:
+        v.append(Violation("İSTİF", "uyari",
+                           f"{len(heavy_on_light)} yük kendisinden belirgin hafif bir yükün üzerinde (izin verilen üst yük "
+                           "sınırı içinde). Mümkünse ağır yükü alta alın.", heavy_on_light))
 
     # 5) İstif dayanımı: üstten alta yük aktarımı
     load_on = np.zeros(n)
@@ -339,10 +352,21 @@ def verify_plan(vehicle: Vehicle, placements: list[Placement], rules: Rules,
         for j, share in supporters[i]:
             load_on[j] += carried * share
     for j, p in enumerate(placements):
-        lim = p.item.max_top_load
-        if lim is not None and p.item.supports_load and load_on[j] > lim + 1e-6:
+        if not p.item.supports_load:
+            continue  # üstüne yük konması zaten İSTİF ihlali olarak yazıldı
+        lim = p.item.top_load_limit
+        if load_on[j] > lim + 1e-6:
+            src = "" if p.item.max_top_load is not None else " (sınır girilmediği için kendi ağırlığı kadar kabul edildi)"
             v.append(Violation("İSTİF DAYANIMI", "hata",
-                               f"{_label(p)} üzerine yaklaşık {load_on[j]:.0f} kg biniyor; izin verilen {lim:.0f} kg.", [p.uid]))
+                               f"{_label(p)} üzerine yaklaşık {load_on[j]:.0f} kg biniyor; izin verilen {lim:.0f} kg{src}.",
+                               [p.uid]))
+
+    # 5a) Soğuk zincir
+    cold = [p.uid for p in placements if p.item.cold_chain]
+    if cold and not vehicle.refrigerated:
+        v.append(Violation("SOĞUK ZİNCİR", "hata",
+                           f"{len(cold)} soğuk zincir yükü frigorifik olmayan araçta: {', '.join(cold[:6])}"
+                           + (" ..." if len(cold) > 6 else ""), cold))
 
     # 5b) Ayrım (birlikte taşınamaz yük grupları)
     if rules.incompatible:
@@ -368,7 +392,57 @@ def verify_plan(vehicle: Vehicle, placements: list[Placement], rules: Rules,
     # 8) Ağırlık dağılımı / aks
     wv, wa = _weight_violations(vehicle, placements)
     v += wv
+
+    # 9) Sabitleme ipuçları (boşluklar)
+    v += securing_warnings(vehicle, placements, arr)
     return v, wa
+
+
+GAP_LIMIT_CM = 15.0
+
+
+def securing_warnings(vehicle: Vehicle, placements: list[Placement], arr: Optional[np.ndarray] = None) -> list[Violation]:
+    """Yükün kayabileceği boşlukları bulur. Bu bir sabitleme HESABI değildir; boşluğu gösterir."""
+    out: list[Violation] = []
+    n = len(placements)
+    if n == 0:
+        return out
+    arr = _arr(placements) if arr is None else arr
+    W = vehicle.width
+    lateral, forward = [], []
+    for i in range(n):
+        b = arr[i]
+        xo = overlap_1d(arr[:, 0], arr[:, 3], b[0], b[3])
+        yo = overlap_1d(arr[:, 1], arr[:, 4], b[1], b[4])
+        zo = overlap_1d(arr[:, 2], arr[:, 5], b[2], b[5])
+        xo[i] = yo[i] = False
+        left = arr[xo & zo & (arr[:, 4] <= b[1] + EPS), 4]
+        right = arr[xo & zo & (arr[:, 1] >= b[4] - EPS), 1]
+        free_y = (b[1] - (left.max() if left.size else 0.0)) + ((right.min() if right.size else W) - b[4])
+        if free_y > GAP_LIMIT_CM:
+            lateral.append((placements[i].uid, free_y))
+        front = arr[yo & zo & (arr[:, 3] <= b[0] + EPS), 3]
+        free_x = b[0] - (front.max() if front.size else 0.0)
+        if free_x > GAP_LIMIT_CM:
+            forward.append((placements[i].uid, free_x))
+    if lateral:
+        ex = max(lateral, key=lambda t: t[1])
+        out.append(Violation("SABİTLEME", "uyari",
+                             f"{len(lateral)} yükün yanlarında toplam {GAP_LIMIT_CM:.0f} cm'den fazla boşluk var "
+                             f"(en büyüğü {ex[0]}: {ex[1]:.0f} cm). Virajda yana kaymaya karşı boşluğu dolgu/hava yastığıyla "
+                             "doldurun veya spanzetle sabitleyin.", [u for u, _ in lateral]))
+    if forward:
+        ex = max(forward, key=lambda t: t[1])
+        out.append(Violation("SABİTLEME", "uyari",
+                             f"{len(forward)} yükün önünde (kabin tarafında) {GAP_LIMIT_CM:.0f} cm'den fazla boşluk var "
+                             f"(en büyüğü {ex[0]}: {ex[1]:.0f} cm). Frende öne kaymaya karşı takoz/boş palet koyun veya "
+                             "spanzetle sabitleyin.", [u for u, _ in forward]))
+    rear_free = vehicle.length - float(arr[:, 3].max())
+    if rear_free > 50:
+        out.append(Violation("SABİTLEME", "uyari",
+                             f"Kapı tarafında {rear_free:.0f} cm boş alan var; son sırayı geriye kaymaya karşı "
+                             "ara bariyer veya spanzetle sabitleyin."))
+    return out
 
 
 def _access_simulation(vehicle, placements, arr, ranks, supporters, zarr, zblocks, rules,

@@ -16,7 +16,8 @@ from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 
-from .models import CARGO_TYPES, FleetPlan, Rules, VehiclePlan
+from .models import BODY_TYPES, CARGO_TYPES, FleetPlan, Rules, VehiclePlan
+from .optimizer import fmt_num
 from .visualization import OTHER, color_map
 
 FONT_DIR = Path(__file__).resolve().parents[1] / "assets" / "fonts"
@@ -131,17 +132,20 @@ def _drawing(pdf: _Doc, plan: VehiclePlan, rules: Rules, view: str, colors: dict
     pdf.set_draw_color(0, 0, 0)
 
 
-def _vehicle_section(pdf: _Doc, plan: VehiclePlan, idx: int, total: int, rules: Rules, manual_edits: int = 0) -> None:
+def _vehicle_section(pdf: _Doc, plan: VehiclePlan, total: int, rules: Rules, manual_edits: int = 0) -> None:
     v = plan.vehicle
     m = plan.metrics
     colors = color_map(plan, "kod")
     pdf.add_page()
-    pdf.h1(f"Yükleme Talimatı - Araç {idx}/{total}")
+    body = f" - {v.body_label}" if v.body_label else ""
+    pdf.h1(f"Yükleme Talimatı - Araç {plan.unit_no}/{total}{body}")
     demo = " (DEMO ölçüler)" if v.is_demo else ""
-    pdf.para(f"{v.name}{demo}  |  İç ölçü: {v.length:.0f} × {v.width:.0f} × {v.height:.0f} cm  |  "
-             f"Azami yük: {v.max_payload_kg:,.0f} kg".replace(",", "."))
-    pdf.para(f"Yük: {m['placed_count']} adet, {m['placed_weight_kg']:,.0f} kg  |  Hacim kullanımı %{100 * m['volume_util']:.0f}  |  "
-             f"Ağırlık kullanımı %{100 * m['weight_util']:.0f}  |  Kullanılan boy {m['used_length_cm']:.0f} cm".replace(",", "."))
+    name = plan.unit_name or v.name
+    pdf.para(f"{name}{demo}  |  {BODY_TYPES.get(v.body_type, '')}  |  İç ölçü: {v.length:.0f} × {v.width:.0f} × "
+             f"{v.height:.0f} cm  |  İstiap: {fmt_num(v.max_payload_kg)} kg")
+    pdf.para(f"Yük: {m['placed_count']} adet, {fmt_num(m['placed_weight_kg'])} kg  |  Hacim kullanımı "
+             f"%{100 * m['volume_util']:.0f}  |  Ağırlık kullanımı %{100 * m['weight_util']:.0f}  |  "
+             f"Kullanılan boy {m['used_length_cm']:.0f} cm  |  {fmt_num(m.get('ldm', 0.0), 1)} LDM")
     if manual_edits:
         pdf.para(f"Not: Bu plan elle düzenlendi ({manual_edits} değişiklik) ve yeniden kontrol edildi.", bold=True)
     pdf.ln(1)
@@ -229,14 +233,19 @@ def _vehicle_section(pdf: _Doc, plan: VehiclePlan, idx: int, total: int, rules: 
 
 def build_loading_pdf(fleet: FleetPlan, rules: Rules, title: Optional[str] = None) -> bytes:
     stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
-    doc_title = title or f"LoadPlanner TR - {fleet.vehicle.name} - {stamp}"
+    doc_title = title or f"LoadPlanner TR - {fleet.label} - {stamp}"
     pdf = _Doc(doc_title)
     n = fleet.n_vehicles
-    for i, plan in enumerate(fleet.plans, start=1):
-        _vehicle_section(pdf, plan, i, n, rules, fleet.metrics.get("manual_edits", 0))
+    for plan in fleet.plans:
+        if not plan.placements and plan.vehicle.body_label:
+            continue  # kombinasyonun boş kalan kasası için sayfa basma
+        _vehicle_section(pdf, plan, n, rules, fleet.metrics.get("manual_edits", 0))
     if not fleet.plans:
         pdf.add_page()
         pdf.h1("Yükleme Talimatı")
+    if fleet.notes:
+        pdf.h2("Filo notları")
+        pdf.para("\n".join(f"• {x}" for x in fleet.notes))
     if fleet.unplaced:
         pdf.h2(f"Yerleştirilemeyen yükler ({len(fleet.unplaced)})")
         pdf.para("\n".join(f"• {u.uid} - {u.item.name}: {u.reason}" for u in fleet.unplaced[:60])

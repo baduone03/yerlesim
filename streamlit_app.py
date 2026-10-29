@@ -20,7 +20,9 @@ from loadplanner.io_csv import (
     unplaced_csv,
 )
 from loadplanner.models import (
+    BODY_TYPES,
     CARGO_TYPES,
+    PALLET_PRESETS,
     OBJECTIVES,
     RULE_MODES,
     AxleConfig,
@@ -29,9 +31,10 @@ from loadplanner.models import (
     Rules,
     Vehicle,
     Zone,
+    doors_for_body,
 )
 from loadplanner.manual import add_unplaced, move_placement, remove_placement, suggest_position, swap_placements
-from loadplanner.optimizer import compare_vehicles
+from loadplanner.optimizer import compare_vehicles, fmt_num
 from loadplanner.pdf_report import build_loading_pdf
 from loadplanner.state_codec import decode_state, encode_state
 from loadplanner.validation import validate_items, validate_vehicle
@@ -41,14 +44,18 @@ from loadplanner.visualization import figure_2d, figure_3d
 EXAMPLE_CSV = Path(__file__).parent / "examples" / "ornek_yukler.csv"
 
 LIMITATIONS = """
-**Bu sürümün sınırları (MVP):**
-- Yerleşim sezgisel bir algoritmayla bulunur; en iyi çözümün bulunduğu garanti edilmez.
-- Yük sabitleme (spanzet, kilit, sürtünme), fren/viraj kuvvetleri ve dinamik yükler **hesaplanmaz**.
+**Bu sürümün sınırları:**
+- Yerleşim sezgisel bir algoritmayla bulunur; en iyi çözümün bulunduğu garanti edilmez. Karma filo seçimi de
+  sezgiseldir (her adımda en uygun aracı seçer).
+- Yük sabitleme (spanzet, kilit, sürtünme), fren/viraj kuvvetleri ve dinamik yükler **hesaplanmaz**; sistem
+  yalnız kayma riski taşıyan boşlukları gösterir.
 - Aks yükleri yalnızca aks konumları girildiyse, iki destekli basit modelle ve yalnız faydalı yük için
   **yaklaşık** hesaplanır. Aks başına izin verilen faydalı yük girilmediyse uygunluk değerlendirilmez.
-- İstif dayanımı yalnızca girilen "üzerine konulabilecek azami ağırlık" değerine göre kontrol edilir.
+- İstif dayanımı girilen "üzerine konulabilecek azami ağırlık" değerine göre, girilmemişse yükün kendi
+  ağırlığı kadar kabul edilerek kontrol edilir.
+- Tenteli araçta yandan erişim düz koridor modeliyle değerlendirilir (forklift yükü yana doğru çeker).
 - Rulo ve özel şekilli yükler çevreleyen dikdörtgen kutu olarak modellenir.
-- Demo araç ölçüleri temsilidir; gerçek aracın iç ölçüleri ve ruhsattaki kapasite girilmelidir.
+- Demo araç ölçüleri temsilidir; gerçek aracın iç ölçüleri ve ruhsattaki istiap haddi girilmelidir.
 - Yük planı bir karar destek çıktısıdır; yükleme güvenliğinin sorumluluğu operasyondadır.
 """
 
@@ -72,7 +79,9 @@ def init_state() -> None:
     if "items" not in ss and "d" in st.query_params:
         # Sayfa yenilendi veya paylaşılan bağlantı açıldı: girdileri adresten geri yükle.
         try:
-            ss["items"], ss["rules"], ss["vehicles"] = decode_state(st.query_params["d"])
+            ss["items"], ss["rules"], ss["vehicles"], avail = decode_state(st.query_params["d"])
+            if avail:
+                ss["avail"] = avail
             ss["saved_state"] = st.query_params["d"]
         except ValueError as e:
             ss.setdefault("flash", []).append(("warning", f"{e}. Boş liste ile başlanıyor."))
@@ -87,7 +96,7 @@ def init_state() -> None:
 
 def signature() -> str:
     ss = st.session_state
-    return repr((ss["items"], ss["vehicles"], ss["rules"]))
+    return repr((ss["items"], ss["vehicles"], ss["rules"], sorted(availability().items()), ss.get("allow_mixed", True)))
 
 
 def flash(msg: str, kind: str = "success") -> None:
@@ -108,20 +117,27 @@ def pct(x: float) -> str:
 # 1. Araç seçimi
 # ----------------------------------------------------------------------------
 
+def _num(v) -> str:
+    return fmt_num(float(v)) if v is not None else "-"
+
+
 def vehicle_tab() -> None:
     vehicles: dict[str, Vehicle] = st.session_state["vehicles"]
     st.subheader("Araç profilleri")
     st.warning(
         "Hazır profillerdeki ölçü ve kapasiteler **DEMO / temsili değerlerdir**, üretici verisi değildir. "
-        "Gerçek planlama için aracınızın iç ölçülerini, ruhsattaki/teknik belgedeki yük kapasitesini "
-        "ve biliyorsanız aks bilgilerini girin."
+        "Gerçek planlama için aracınızın iç ölçülerini, ruhsattaki **istiap haddini** ve biliyorsanız "
+        "aks bilgilerini girin."
     )
-    rows = [{
-        "Araç": v.name, "İç boy (cm)": v.length, "İç en (cm)": v.width, "İç yükseklik (cm)": v.height,
-        "Hacim (m³)": round(v.volume_cm3 / 1e6, 2), "Azami yük (kg)": v.max_payload_kg,
-        "Kapılar": ", ".join({"arka": "arka", "yan_sol": "sol yan", "yan_sag": "sağ yan"}[d.kind] for d in v.doors),
-        "Veri": "DEMO" if v.is_demo else "Kullanıcı",
-    } for v in vehicles.values()]
+    rows = []
+    for v in vehicles.values():
+        dims = " + ".join(f"{b.length:.0f}×{b.width:.0f}×{b.height:.0f}" for b in v.bodies)
+        rows.append({
+            "Araç": v.name, "Kasa": BODY_TYPES.get(v.body_type, v.body_type).split(" (")[0],
+            "İç ölçü (cm)": dims, "Hacim (m³)": round(v.total_volume_cm3 / 1e6, 1),
+            "İstiap (kg)": _num(v.total_payload_kg), "Sefer (TL)": _num(v.trip_cost),
+            "Veri": "DEMO" if v.is_demo else "Kullanıcı",
+        })
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
     vid = st.selectbox("Düzenlenecek profil", list(vehicles), format_func=lambda k: vehicles[k].name)
@@ -131,15 +147,37 @@ def vehicle_tab() -> None:
 
     with st.form(f"veh_{vid}"):
         name = st.text_input("Profil adı", v.name)
+        body_types = list(BODY_TYPES)
+        body = st.selectbox("Kasa tipi", body_types, index=body_types.index(v.body_type) if v.body_type in body_types else 0,
+                            format_func=BODY_TYPES.get,
+                            help="Kasa tipi kapıları belirler: tenteli araçta iki yandan forkliftle erişim vardır; "
+                                 "frigorifik araç soğuk zincir yüklerini taşıyabilir. 'Özel' seçilirse kapılar "
+                                 "aşağıdaki 'Kapılar' bölümünden alınır.")
         c1, c2 = st.columns(2)
         length = c1.number_input("İç uzunluk (cm)", min_value=0.0, value=float(v.length), step=5.0)
         width = c2.number_input("İç genişlik (cm)", min_value=0.0, value=float(v.width), step=5.0)
         c1, c2 = st.columns(2)
         height = c1.number_input("İç yükseklik (cm)", min_value=0.0, value=float(v.height), step=5.0)
-        payload = c2.number_input("Azami faydalı yük (kg) - ruhsattaki değer", min_value=0.0,
+        payload = c2.number_input("İstiap haddi / azami faydalı yük (kg)", min_value=0.0,
                                   value=float(v.max_payload_kg), step=50.0)
+        cost = st.number_input("Sefer maliyeti (TL, isteğe bağlı)", min_value=0.0, step=500.0,
+                               value=None if v.trip_cost is None else float(v.trip_cost),
+                               help="Girilirse 'Minimum maliyet' hedefi ve karma filo seçiminde kullanılır.")
 
-        door_box = st.expander("Kapılar", expanded=False)
+        tr = v.trailer
+        if tr is not None:
+            st.markdown("**Römork**")
+            c1, c2 = st.columns(2)
+            t_len = c1.number_input("Römork iç uzunluk (cm)", min_value=0.0, value=float(tr.length), step=5.0)
+            t_wid = c2.number_input("Römork iç genişlik (cm)", min_value=0.0, value=float(tr.width), step=5.0)
+            c1, c2 = st.columns(2)
+            t_hei = c1.number_input("Römork iç yükseklik (cm)", min_value=0.0, value=float(tr.height), step=5.0)
+            t_pay = c2.number_input("Römork istiap haddi (kg)", min_value=0.0, value=float(tr.max_payload_kg), step=50.0)
+            t_body = st.selectbox("Römork kasa tipi", body_types[:3],
+                                  index=body_types.index(tr.body_type) if tr.body_type in body_types[:3] else 0,
+                                  format_func=BODY_TYPES.get)
+
+        door_box = st.expander("Kapılar (yalnız kasa tipi 'Özel' ise kullanılır)", expanded=False)
         rear = next((d for d in v.doors if d.kind == "arka"), None)
         left = next((d for d in v.doors if d.kind == "yan_sol"), None)
         right = next((d for d in v.doors if d.kind == "yan_sag"), None)
@@ -178,18 +216,21 @@ def vehicle_tab() -> None:
                              "geçişi_keser": z.blocks_passage} for z in v.zones],
                            columns=["ad", "x", "y", "z", "dx", "dy", "dz", "geçişi_keser"])
         zdf = zone_box.data_editor(zdf, num_rows="dynamic", width="stretch", key=f"zones_{vid}",
-                             column_config={"geçişi_keser": st.column_config.CheckboxColumn(
-                                 help="İşaretliyse fiziksel engeldir; yükün kapıya giden yolunu da keser.")})
+                                   column_config={"geçişi_keser": st.column_config.CheckboxColumn(
+                                       help="İşaretliyse fiziksel engeldir; yükün kapıya giden yolunu da keser.")})
         is_demo = st.checkbox("Bu profil DEMO değer içeriyor", v.is_demo)
         saved = st.form_submit_button("Profili kaydet", type="primary")
 
     if saved:
-        doors = []
-        if has_rear:
-            doors.append(Door("arka", width=rear_w or None, height=rear_h or None))
-        for kind, (on, xs, xe, hh) in side.items():
-            if on:
-                doors.append(Door(kind, x_start=xs, x_end=xe, height=hh or None))
+        if body == "ozel":
+            doors = []
+            if has_rear:
+                doors.append(Door("arka", width=rear_w or None, height=rear_h or None))
+            for kind, (on, xs, xe, hh) in side.items():
+                if on:
+                    doors.append(Door(kind, x_start=xs, x_end=xe, height=hh or None))
+        else:
+            doors = doors_for_body(body, length)
         zones = []
         zerr = []
         for _, r in zdf.iterrows():
@@ -205,8 +246,14 @@ def vehicle_tab() -> None:
             axles.front_x, axles.rear_x = fx, rx
             axles.front_payload_limit_kg = fl or None
             axles.rear_payload_limit_kg = rl or None
+        trailer = None
+        if tr is not None:
+            trailer = copy.deepcopy(tr)
+            trailer.length, trailer.width, trailer.height, trailer.max_payload_kg = t_len, t_wid, t_hei, t_pay
+            trailer.body_type, trailer.doors = t_body, doors_for_body(t_body, t_len)
         nv = Vehicle(id=vid, name=name, category=v.category, length=length, width=width, height=height,
-                     max_payload_kg=payload, doors=doors, zones=zones, axles=axles, is_demo=is_demo, notes=v.notes)
+                     max_payload_kg=payload, doors=doors, zones=zones, axles=axles, is_demo=is_demo, notes=v.notes,
+                     body_type=body, trailer=trailer, trip_cost=cost, body_label=v.body_label)
         errs = zerr + validate_vehicle(nv)
         if errs:
             for e in errs:
@@ -226,6 +273,7 @@ def vehicle_tab() -> None:
 # ----------------------------------------------------------------------------
 
 def item_fields(prefix: str, it: CargoItem) -> dict:
+    """Yük formu alanları. Sık kullanılanlar üstte, nadir olanlar 'Diğer özellikler' altında."""
     c1, c2 = st.columns(2)
     d = {}
     d["code"] = c1.text_input("Ürün kodu *", it.code, key=f"{prefix}_code")
@@ -235,34 +283,44 @@ def item_fields(prefix: str, it: CargoItem) -> dict:
     d["cargo_type"] = c1.selectbox("Yük tipi", types, index=types.index(it.cargo_type) if it.cargo_type in types else 1,
                                    format_func=CARGO_TYPES.get, key=f"{prefix}_type")
     d["quantity"] = c2.number_input("Adet", min_value=0, step=1, value=int(it.quantity), key=f"{prefix}_qty")
+    presets = ["elle"] + list(PALLET_PRESETS)
+    preset = st.selectbox("Palet tabanı", presets, key=f"{prefix}_preset",
+                          format_func=lambda k: "Ölçüyü elle gir" if k == "elle" else PALLET_PRESETS[k][0],
+                          help="Seçilirse boy ve en otomatik dolar; yüksekliği yükle birlikte (palet dahil) girin.")
     st.caption("Dış ölçüler (cm). Palet için **palet dahil** toplam dış ölçüyü girin.")
     c3, c4, c5 = st.columns(3)
     d["length"] = c3.number_input("Boy", min_value=0.0, value=float(it.length), step=1.0, key=f"{prefix}_L")
     d["width"] = c4.number_input("En", min_value=0.0, value=float(it.width), step=1.0, key=f"{prefix}_W")
     d["height"] = c5.number_input("Yükseklik", min_value=0.0, value=float(it.height), step=1.0, key=f"{prefix}_H")
+    if preset != "elle":
+        d["length"], d["width"] = PALLET_PRESETS[preset][1], PALLET_PRESETS[preset][2]
     c1, c2 = st.columns(2)
     d["unit_weight"] = c1.number_input("Birim ağırlık (kg)", min_value=0.0, value=float(it.unit_weight), step=1.0, key=f"{prefix}_kg")
-    d["max_top_load"] = c2.number_input("Üzerine konulabilecek azami ağırlık (kg, boş = sınır yok)", min_value=0.0,
-                                        value=None if it.max_top_load is None else float(it.max_top_load),
-                                        key=f"{prefix}_top")
-    c1, c2 = st.columns(2)
-    d["allow_on_top"] = c1.checkbox("Üstüne başka yük konulabilir", it.allow_on_top, key=f"{prefix}_aot")
-    d["stackable"] = c2.checkbox("İstiflenebilir (başka yükün üstüne konulabilir)", it.stackable, key=f"{prefix}_stk")
-    c1, c2 = st.columns(2)
-    d["rotatable"] = c1.checkbox("90° döndürülebilir (dikey eksen)", it.rotatable, key=f"{prefix}_rot")
-    d["allow_tipping"] = c2.checkbox("Yan yatırılabilir (diğer yönler)", it.allow_tipping, key=f"{prefix}_tip")
-    c1, c2 = st.columns(2)
-    d["fragile"] = c1.checkbox("Kırılabilir / hassas", it.fragile, key=f"{prefix}_frg")
-    d["includes_pallet"] = c2.checkbox("Ölçüler palet dahil", it.includes_pallet, key=f"{prefix}_pal")
-    c1, c2 = st.columns(2)
-    d["delivery_stop"] = c1.number_input("Teslimat sırası (1 = ilk durak)", min_value=1, step=1,
+    d["delivery_stop"] = c2.number_input("Teslimat sırası (1 = ilk durak)", min_value=1, step=1,
                                          value=int(it.delivery_stop), key=f"{prefix}_stop")
-    d["loading_priority"] = c2.number_input("Yükleme önceliği (1 = ilk yüklenen)", min_value=1, step=1,
-                                            value=int(it.loading_priority), key=f"{prefix}_prio")
-    d["notes"] = st.text_input("Sabitleme / taşıma notları", it.notes, key=f"{prefix}_notes")
-    d["segregation_group"] = st.text_input(
-        "Ayrım grubu (isteğe bağlı, ör. gıda, kimyasal)", it.segregation_group, key=f"{prefix}_seg",
-        help="Hangi grupların birlikte taşınamayacağı 'Kurallar' sekmesinde tanımlanır.")
+    c1, c2, c3 = st.columns(3)
+    d["allow_on_top"] = c1.checkbox("Üstüne yük konabilir", it.allow_on_top, key=f"{prefix}_aot")
+    d["fragile"] = c2.checkbox("Kırılabilir / hassas", it.fragile, key=f"{prefix}_frg")
+    d["cold_chain"] = c3.checkbox("Soğuk zincir", it.cold_chain, key=f"{prefix}_cold",
+                                  help="İşaretlenirse yük yalnız frigorifik araca yüklenir.")
+    with st.expander("Diğer özellikler (istif dayanımı, döndürme, öncelik, notlar)"):
+        d["max_top_load"] = st.number_input(
+            "Üzerine konulabilecek azami ağırlık (kg)", min_value=0.0, key=f"{prefix}_top",
+            value=None if it.max_top_load is None else float(it.max_top_load),
+            help="Boş bırakılırsa yükün kendi ağırlığı kadar kabul edilir (aynı yükten biri üstüne konabilir, "
+                 "daha ağırı konamaz).")
+        c1, c2 = st.columns(2)
+        d["stackable"] = c1.checkbox("Başka yükün üstüne konabilir", it.stackable, key=f"{prefix}_stk")
+        d["rotatable"] = c2.checkbox("90° döndürülebilir (dikey eksen)", it.rotatable, key=f"{prefix}_rot")
+        c1, c2 = st.columns(2)
+        d["allow_tipping"] = c1.checkbox("Yan yatırılabilir", it.allow_tipping, key=f"{prefix}_tip")
+        d["includes_pallet"] = c2.checkbox("Ölçüler palet dahil", it.includes_pallet, key=f"{prefix}_pal")
+        d["loading_priority"] = st.number_input("Yükleme önceliği (1 = ilk yüklenen; yalnız FIFO/LIFO kuralında)",
+                                                min_value=1, step=1, value=int(it.loading_priority), key=f"{prefix}_prio")
+        d["segregation_group"] = st.text_input(
+            "Ayrım grubu (ör. gıda, kimyasal)", it.segregation_group, key=f"{prefix}_seg",
+            help="Hangi grupların birlikte taşınamayacağı 'Kurallar' sekmesinde tanımlanır.")
+        d["notes"] = st.text_input("Sabitleme / taşıma notları", it.notes, key=f"{prefix}_notes")
     d["code"] = d["code"].strip()
     d["name"] = d["name"].strip() or d["code"]
     return d
@@ -312,8 +370,9 @@ def items_tab() -> None:
         st.rerun()
 
     for idx, it in enumerate(items):
+        flags = "".join([" ❄️" if it.cold_chain else "", " ⚠️kırılır" if it.fragile else ""])
         with st.expander(f"{it.code} - {it.name} × {it.quantity}  |  {it.length:.0f}×{it.width:.0f}×{it.height:.0f} cm, "
-                         f"{it.unit_weight:.0f} kg, durak {it.delivery_stop}"):
+                         f"{it.unit_weight:.0f} kg, durak {it.delivery_stop}{flags}"):
             with st.form(f"edit_{idx}_{it.code}"):
                 d = item_fields(f"e{idx}_{it.code}", it)
                 c1, c2 = st.columns(2)
@@ -387,22 +446,27 @@ def items_tab() -> None:
 def rules_tab() -> None:
     r: Rules = st.session_state["rules"]
     st.subheader("Yükleme ve boşaltma kuralları")
-    mode = st.radio("Boşaltma sırası kuralı", list(RULE_MODES), format_func=RULE_MODES.get,
+    mode = st.radio("Boşaltma sırası", list(RULE_MODES), format_func=RULE_MODES.get,
                     index=list(RULE_MODES).index(r.mode))
-    st.info(
-        "- **Teslimat sırası:** boşaltma sırası yüklerin *teslimat sırası* alanına göre belirlenir "
-        "(1. durak ilk). Yükleme sırası bundan geriye doğru hesaplanır.\n"
-        "- **LIFO:** *yükleme önceliği* büyük olan (son yüklenen) ilk çıkar. Arka kapılı araçların doğal düzenidir.\n"
-        "- **FIFO:** ilk yüklenen ilk çıkar. Tek arka kapılı araçta ancak farklı öncelikteki yükler "
-        "birbirinin önüne geçmezse (yan yana şeritler) mümkündür; aksi hâlde yük yerleştirilemez ve nedeni bildirilir.\n\n"
-        "Her durumda gerçek erişim kontrol edilir: bir yükü çıkarmak için önce başka bir yükü indirmek gerekiyorsa "
-        "bu **erişim ihlali** olarak raporlanır."
-    )
-    mixed = st.checkbox("Farklı boşaltma sırasındaki yükler üst üste konulabilir", r.allow_mixed_stop_stacking,
-                        help="Kapalıyken (önerilen) her istif tek bir durağa ait yüklerden oluşur.")
-    sup = st.slider("Üstteki yük için asgari taban desteği (%)", 50, 100, int(r.min_support_ratio * 100), 5)
-    clear = st.number_input("Arka kapı önünde boş bırakılacak mesafe (cm)", min_value=0.0, value=float(r.rear_clearance_cm), step=10.0)
-    st.caption("Kapı tanımları (arka/yan kapı) ve yasak bölgeler 'Araç Seçimi' sekmesinde araç profiline göre girilir.")
+    with st.expander("Bu seçenekler ne demek?"):
+        st.markdown(
+            "- **Teslimat sırası:** yükler *teslimat sırası* alanına göre boşaltılır (1. durak ilk); 1. durağın yükü "
+            "kapıya en yakın konur. Yükleme sırası bundan geriye doğru hesaplanır.\n"
+            "- **LIFO:** *yükleme önceliği* büyük olan (son yüklenen) ilk çıkar. Arka kapılı araçların doğal düzenidir.\n"
+            "- **FIFO:** ilk yüklenen ilk çıkar. Tek arka kapılı araçta ancak farklı öncelikteki yükler birbirinin "
+            "önüne geçmezse (yan yana şeritler) mümkündür; tenteli araçta yandan erişim işi kolaylaştırır.\n\n"
+            "Her durumda gerçek erişim kontrol edilir: bir yükü çıkarmak için önce başka bir yükü indirmek "
+            "gerekiyorsa bu **erişim ihlali** olarak raporlanır.")
+
+    with st.expander("Gelişmiş kurallar"):
+        mixed = st.checkbox("Farklı duraklara ait yükler üst üste konabilir", r.allow_mixed_stop_stacking,
+                            help="Kapalıyken (önerilen) her istif tek bir durağın yüklerinden oluşur.")
+        center = st.checkbox("Kısmi yükü kasa ortasına doğru kaydır (aks dengesi)", r.center_partial_load,
+                             help="Yük kasayı doldurmuyorsa bütün yük kapıya doğru kaydırılarak ağırlık merkezi "
+                                  "kasa ortasına yaklaştırılır. Önde kalan boşluk takoz/boş paletle doldurulmalıdır.")
+        sup = st.slider("Üstteki yük için asgari taban desteği (%)", 50, 100, int(r.min_support_ratio * 100), 5)
+        clear = st.number_input("Arka kapı önünde boş bırakılacak mesafe (cm)", min_value=0.0,
+                                value=float(r.rear_clearance_cm), step=10.0)
 
     st.markdown("#### Birlikte taşınamaz yük grupları")
     st.caption("Yüklere 'Ayrım grubu' verin (ör. gıda, kimyasal). Burada eşleştirilen gruplar üst üste konulmaz "
@@ -429,7 +493,7 @@ def rules_tab() -> None:
     for line in bad_lines:
         st.error(f"Anlaşılamayan satır: '{line}'. Biçim: grup1, grup2")
     new = Rules(mode=mode, allow_mixed_stop_stacking=mixed, min_support_ratio=sup / 100, rear_clearance_cm=clear,
-                incompatible=tuple(pairs), separation_cm=sep)
+                incompatible=tuple(pairs), separation_cm=sep, center_partial_load=center)
     if new != r:
         st.session_state["rules"] = new
         st.rerun()
@@ -446,38 +510,69 @@ def rules_tab() -> None:
 # 4. Optimizasyon
 # ----------------------------------------------------------------------------
 
+DEFAULT_AVAILABLE = 3
+
+
+def availability() -> dict[str, int]:
+    ss = st.session_state
+    av = ss.setdefault("avail", {})
+    for k in ss["vehicles"]:
+        av.setdefault(k, 0 if k == "ozel" else DEFAULT_AVAILABLE)
+    return av
+
+
 def optimize_tab() -> None:
     ss = st.session_state
     vehicles: dict[str, Vehicle] = ss["vehicles"]
-    st.subheader("Optimizasyon")
-    obj = st.radio("Optimizasyon önceliği", list(OBJECTIVES), format_func=OBJECTIVES.get,
+    st.subheader("Araç seçimi ve hesaplama")
+    obj = st.radio("Öncelik", list(OBJECTIVES), format_func=OBJECTIVES.get,
                    index=list(OBJECTIVES).index(ss["objective"]), horizontal=True)
     ss["objective"] = obj
-    default_sel = [k for k in vehicles if k != "ozel"]
-    sel = st.multiselect("Karşılaştırılacak araç profilleri", list(vehicles), default=default_sel,
-                         format_func=lambda k: vehicles[k].name)
-    c1, c2 = st.columns(2)
-    max_n = c1.number_input("Bir araç tipinden en fazla kaç araç kullanılabilir", 1, 20, 5)
-    depth = c2.selectbox("Arama derinliği", ["hizli", "normal", "kapsamli"], index=1,
-                         format_func={"hizli": "Hızlı", "normal": "Normal", "kapsamli": "Kapsamlı (yavaş)"}.get)
-    st.caption("Her araç tipi için gerçek 3D yerleşim yapılır; seçim yalnız hacme veya ağırlığa göre yapılmaz. "
-               "Karma filo (farklı tiplerden araçlar birlikte) bu sürümde desteklenmez.")
+
+    st.markdown("**Kullanılabilir araçlar**")
+    st.caption("Her araç tipinden kaç adet kullanılabileceğini (0 = kullanma) ve biliyorsanız sefer maliyetini girin. "
+               "Maliyet 'Minimum maliyet' önceliğinde ve karma filo seçiminde kullanılır.")
+    av = availability()
+    df = pd.DataFrame([{"id": k, "Araç": v.name, "Adet": int(av.get(k, 0)), "Sefer maliyeti (TL)": v.trip_cost}
+                       for k, v in vehicles.items()])
+    edited = st.data_editor(
+        df, hide_index=True, width="stretch", key="avail_editor",
+        column_config={"id": None, "Araç": st.column_config.TextColumn(disabled=True),
+                       "Adet": st.column_config.NumberColumn(min_value=0, max_value=50, step=1, required=True),
+                       "Sefer maliyeti (TL)": st.column_config.NumberColumn(min_value=0, step=500, format="%.0f")})
+    for _, row in edited.iterrows():
+        k = row["id"]
+        n = int(row["Adet"]) if not pd.isna(row["Adet"]) else 0
+        av[k] = max(n, 0)
+        c = None if pd.isna(row["Sefer maliyeti (TL)"]) else float(row["Sefer maliyeti (TL)"])
+        if c != vehicles[k].trip_cost:
+            vehicles[k] = copy.deepcopy(vehicles[k])
+            vehicles[k].trip_cost = c
+    allow_mixed = st.checkbox("Farklı araç tiplerini birlikte kullanabilir (karma filo)", value=ss.get("allow_mixed", True))
+    ss["allow_mixed"] = allow_mixed
+    with st.expander("Gelişmiş"):
+        depth = st.selectbox("Arama derinliği", ["hizli", "normal", "kapsamli"], index=1,
+                             format_func={"hizli": "Hızlı", "normal": "Normal (önerilen)", "kapsamli": "Kapsamlı (yavaş)"}.get)
+    sel = [k for k in vehicles if av.get(k, 0) > 0]
 
     if st.button("🚚 Yerleşimi hesapla", type="primary", width="stretch"):
         errs, warns = validate_items(ss["items"])
         for v in sel:
             errs += validate_vehicle(vehicles[v])
         if not sel:
-            errs.append("En az bir araç profili seçin.")
+            errs.append("En az bir araç tipine 0'dan büyük adet girin.")
         if errs:
             for e in errs:
                 st.error(e)
             return
         for w in warns:
             st.info(w)
-        with st.spinner("3D yerleşim hesaplanıyor..."):
-            res = compare_vehicles([copy.deepcopy(vehicles[v]) for v in sel], ss["items"], ss["rules"],
-                                   objective=obj, max_vehicles=int(max_n), depth=depth)
+        bar = st.progress(0.0, text="Hazırlanıyor...")
+        res = compare_vehicles([copy.deepcopy(vehicles[v]) for v in sel], ss["items"], ss["rules"],
+                               objective=obj, depth=depth, availability={k: av[k] for k in sel},
+                               allow_mixed=allow_mixed,
+                               progress=lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t))
+        bar.empty()
         ss["results"] = res
         ss["results_original"] = copy.deepcopy(res)
         ss["result_sig"] = signature()
@@ -490,27 +585,37 @@ def optimize_tab() -> None:
     if ss["result_sig"] != signature():
         st.warning("Girdiler son hesaplamadan sonra değişti. Sonuçlar güncel değil; yeniden hesaplayın.")
     best = res[0]
-    if best.metrics["unplaced_count"] == 0 and best.metrics["error_count"] == 0:
-        st.success(f"Önerilen araç: **{best.vehicle.name}** × {best.n_vehicles}")
+    m = best.metrics
+    if m["unplaced_count"] == 0 and m["error_count"] == 0:
+        st.success(f"Önerilen: **{best.label}**")
     else:
-        st.error(f"Hiçbir araç tipiyle bütün yükler kurallara uygun yerleştirilemedi. En iyi seçenek: "
-                 f"**{best.vehicle.name}** × {best.n_vehicles}. Ayrıntılar 'Sonuç Raporu' sekmesinde.")
+        st.error(f"Bütün yükler kurallara uygun yerleştirilemedi. En iyi seçenek: **{best.label}**. "
+                 "Ayrıntılar 'Rapor' sekmesinde.")
+    c = st.columns(4)
+    c[0].metric("Araç", m["n_vehicles"])
+    c[1].metric("Yerleşen yük", f"{m['placed_count']}/{m['total_units']}")
+    c[2].metric("Yükleme metresi", f"{fmt_num(m['ldm'], 1)} LDM")
+    c[3].metric("Sefer maliyeti", f"{fmt_num(m['total_cost'])} TL" if m["total_cost"] is not None else "-")
     st.write(best.explanation)
+    for note in best.notes:
+        st.warning(note)
     rows = []
     for i, f in enumerate(res):
-        m = f.metrics
+        fm = f.metrics
         rows.append({
-            "Sıra": i + 1, "Araç": f.vehicle.name, "Araç sayısı": m["n_vehicles"],
-            "Yerleşen": f"{m['placed_count']}/{m['total_units']}", "Yerleşmeyen": m["unplaced_count"],
-            "Hacim kullanımı": pct(m["volume_util"]), "Ağırlık kullanımı": pct(m["weight_util"]),
-            "İhlal": m["error_count"], "Alt sınır (ağırlık/hacim)": f"{m['min_by_weight']} / {m['min_by_volume']}",
+            "Seçenek": f"{i + 1}. {f.label}" + (" (karma)" if f.mixed else ""),
+            "Yerleşen": f"{fm['placed_count']}/{fm['total_units']}",
+            "Hacim": pct(fm["volume_util"]), "Ağırlık": pct(fm["weight_util"]),
+            "LDM": fmt_num(fm["ldm"], 1),
+            "Maliyet (TL)": fmt_num(fm["total_cost"]) if fm["total_cost"] is not None else "-",
+            "İhlal": fm["error_count"],
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption("'Alt sınır': yalnız ağırlık veya yalnız hacim hesabına göre gereken en az araç sayısı. "
-               "3D yerleşim bu sayıdan fazla araç gerektirebilir. Hacim kullanımı tek başına başarı ölçütü değildir.")
+    st.caption("Hacim ve ağırlık oranı kullanılan araçların toplam kapasitesine göredir; tek başına başarı ölçütü "
+               "değildir. LDM: kaplanan taban alanının 2,40 m genişliğe göre yükleme metresi karşılığı.")
     ss["view_idx"] = st.selectbox("İncelenecek seçenek (3D, rapor ve dışa aktarma için)", range(len(res)),
                                   index=min(ss.get("view_idx", 0), len(res) - 1),
-                                  format_func=lambda i: f"{i + 1}. {res[i].vehicle.name} × {res[i].n_vehicles}")
+                                  format_func=lambda i: f"{i + 1}. {res[i].label}")
 
 
 def current_fleet():
@@ -533,12 +638,19 @@ def view_tab() -> None:
         st.error("Bu araç tipine hiçbir yük yerleştirilemedi.")
         return
     rules = st.session_state["rules"]
-    st.subheader(f"{fleet.vehicle.name} × {fleet.n_vehicles}")
+    st.subheader(fleet.label)
     k = 0
-    if fleet.n_vehicles > 1:
-        k = st.radio("Araç", range(fleet.n_vehicles), format_func=lambda i: f"Araç {i + 1}", horizontal=True)
+    if len(fleet.plans) > 1:
+        def plan_label(i: int) -> str:
+            p = fleet.plans[i]
+            name = p.vehicle.body_label or (p.unit_name or p.vehicle.name)
+            return f"Araç {p.unit_no} · {name}" + (" (boş)" if not p.placements else "")
+        k = st.radio("Araç", range(len(fleet.plans)), format_func=plan_label, horizontal=True)
     plan = fleet.plans[k]
     n = len(plan.placements)
+    if n == 0:
+        st.info("Bu kasaya yük yerleştirilmedi.")
+        return
     c1, c2, c3 = st.columns(3)
     labels = c1.toggle("Etiketleri göster", value=n <= 60)
     color_by = c2.radio("Renk", ["kod", "durak"], format_func={"kod": "Ürün koduna göre", "durak": "Teslimat durağına göre"}.get)
@@ -680,30 +792,40 @@ def report_tab() -> None:
     if fleet is ss["results"][0]:
         st.markdown(f"**Seçilen araç ve neden:** {fleet.explanation}")
     else:
-        st.markdown(f"**İncelenen seçenek:** {fleet.vehicle.name} (önerilen seçenek değil).")
+        st.markdown(f"**İncelenen seçenek:** {fleet.label} (önerilen seçenek değil).")
     c = st.columns(3)
     c[0].metric("Toplam yük adedi", m["total_units"])
-    c[1].metric("Toplam ağırlık", f"{m['total_weight_kg']:,.0f} kg".replace(",", "."))
-    c[2].metric("Toplam hacim", f"{m['total_volume_m3']:.2f} m³".replace(".", ","))
+    c[1].metric("Toplam ağırlık", f"{fmt_num(m['total_weight_kg'])} kg")
+    c[2].metric("Toplam hacim", f"{fmt_num(m['total_volume_m3'], 2)} m³")
     c = st.columns(3)
     c[0].metric("Araç sayısı", m["n_vehicles"])
     c[1].metric("Yerleşen / yerleşmeyen", f"{m['placed_count']} / {m['unplaced_count']}")
     c[2].metric("İhlal", m["error_count"])
 
-    for conf in rule_conflicts(ss["items"], ss["rules"], fleet.vehicle):
-        st.warning(conf.message)
+    shown_conf = set()
+    for plan in fleet.plans:
+        for conf in rule_conflicts(ss["items"], ss["rules"], plan.vehicle):
+            if conf.message not in shown_conf:
+                shown_conf.add(conf.message)
+                st.warning(conf.message)
+    for note in fleet.notes:
+        st.warning(note)
 
     for i, plan in enumerate(fleet.plans):
         pm = plan.metrics
-        with st.expander(f"Araç {i + 1}: {pm['placed_count']} yük, hacim {pct(pm['volume_util'])}, "
-                         f"ağırlık {pct(pm['weight_util'])}, {len(plan.errors)} ihlal", expanded=i == 0):
+        if not plan.placements:
+            st.caption(f"{plan.title}: boş.")
+            continue
+        with st.expander(f"{plan.title} ({plan.unit_name or plan.vehicle.name}): {pm['placed_count']} yük, "
+                         f"hacim {pct(pm['volume_util'])}, ağırlık {pct(pm['weight_util'])}, {len(plan.errors)} ihlal",
+                         expanded=i == 0):
             c = st.columns(3)
             c[0].metric("Hacim kullanımı", pct(pm["volume_util"]))
             c[1].metric("Ağırlık kullanımı", pct(pm["weight_util"]))
-            c[2].metric("Kullanılan boy", f"{pm['used_length_cm']:.0f} cm")
-            st.caption(f"Yerleşen yük ağırlığı {pm['placed_weight_kg']:.0f} / {plan.vehicle.max_payload_kg:.0f} kg; "
-                       f"en yüksek nokta {pm['max_height_cm']:.0f} cm; üst üste konan yük sayısı {pm['stacked_count']}; "
-                       f"strateji: {plan.strategy}.")
+            c[2].metric("Yükleme metresi", f"{fmt_num(pm.get('ldm', 0.0), 1)} LDM")
+            st.caption(f"Yerleşen yük ağırlığı {fmt_num(pm['placed_weight_kg'])} / {fmt_num(plan.vehicle.max_payload_kg)} kg; "
+                       f"kullanılan boy {pm['used_length_cm']:.0f} cm; en yüksek nokta {pm['max_height_cm']:.0f} cm; "
+                       f"üst üste konan yük sayısı {pm['stacked_count']}; strateji: {plan.strategy}.")
             if pm.get("cog"):
                 cx, cy, cz = pm["cog"]
                 st.caption(f"Yük ağırlık merkezi (yaklaşık): X={cx:.0f}, Y={cy:.0f} (kasa ortası {plan.vehicle.width / 2:.0f}), Z={cz:.0f} cm.")
@@ -814,7 +936,10 @@ def main() -> None:
 def save_state_to_url() -> None:
     """Girdileri adres satırına yazar; sayfa yenilenince init_state geri yükler."""
     ss = st.session_state
-    enc = encode_state(ss["items"], ss["rules"], ss["vehicles"])
+    av = availability()
+    defaults = {k: (0 if k == "ozel" else DEFAULT_AVAILABLE) for k in ss["vehicles"]}
+    changed_av = {k: n for k, n in av.items() if defaults.get(k) != n}
+    enc = encode_state(ss["items"], ss["rules"], ss["vehicles"], changed_av)
     if enc == ss.get("saved_state"):
         return
     ss["saved_state"] = enc

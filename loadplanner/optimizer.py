@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -37,6 +37,7 @@ from .constraints import (
     zone_arrays,
 )
 from .models import (
+    LDM_REFERENCE_WIDTH_CM,
     CargoItem,
     CargoUnit,
     FleetPlan,
@@ -60,10 +61,24 @@ SORTS = ("agirlik", "hacim", "taban", "yukseklik")
 ORIENTS = ("ince", "uzun")
 
 
+def _st(name: str) -> Strategy:
+    s, o, f = name.split("/")
+    return Strategy(name, s, o, f)
+
+
+# Strateji setleri, 6 farklı yük listesi x 4 araç üzerinde 16 stratejinin tamamıyla
+# karşılaştırılarak seçildi: "normal" set, tam aramaya göre toplam 1 yük fazla
+# dışarıda bırakırken 4 kat hızlıdır. ("duvar": kabinden kapıya duvar örme,
+# "serit": boyuna şeritler; kalabalık listelerde şerit belirgin daha iyi.)
+SCREEN_SET = ("hacim/uzun/duvar", "yukseklik/uzun/serit")
+NORMAL_SET = ("hacim/uzun/duvar", "taban/ince/duvar", "yukseklik/ince/duvar", "agirlik/uzun/serit")
+
+
 def default_strategies(depth: str = "normal", mode: str = "teslimat") -> list[Strategy]:
-    sorts = SORTS[:2] if depth == "hizli" else SORTS
-    fills = ("duvar", "serit") if (depth == "kapsamli" or mode == "FIFO") else ("duvar",)
-    return [Strategy(f"{s}/{o}/{f}", s, o, f) for f in fills for s in sorts for o in ORIENTS]
+    if depth == "kapsamli":
+        return [Strategy(f"{s}/{o}/{f}", s, o, f) for f in ("duvar", "serit") for s in SORTS for o in ORIENTS]
+    names = SCREEN_SET if depth == "hizli" else NORMAL_SET
+    return [_st(n) for n in names]
 
 
 def expand_units(items: list[CargoItem]) -> list[CargoUnit]:
@@ -75,7 +90,9 @@ def expand_units(items: list[CargoItem]) -> list[CargoUnit]:
 
 
 def fits_empty(vehicle: Vehicle, item: CargoItem) -> tuple[bool, str]:
-    """Yük boş araca tek başına (ölçü, kapı, ağırlık olarak) sığar mı?"""
+    """Yük boş kasaya tek başına (soğuk zincir, ölçü, kapı, ağırlık olarak) sığar mı?"""
+    if item.cold_chain and not vehicle.refrigerated:
+        return False, "Soğuk zincir gerektiren yük; araç frigorifik değil."
     if item.unit_weight > vehicle.max_payload_kg + EPS:
         return False, (f"Birim ağırlık ({item.unit_weight:.0f} kg) aracın azami yük kapasitesini "
                        f"({vehicle.max_payload_kg:.0f} kg) aşıyor.")
@@ -92,6 +109,17 @@ def fits_empty(vehicle: Vehicle, item: CargoItem) -> tuple[bool, str]:
         return False, (f"Ölçüler ({item.length:.0f}x{item.width:.0f}x{item.height:.0f} cm) izin verilen hiçbir yönde "
                        f"araç iç ölçülerine ({vehicle.length:.0f}x{vehicle.width:.0f}x{vehicle.height:.0f} cm) sığmıyor.")
     return False, "Yük kapı açıklığından geçmiyor."
+
+
+def fits_vehicle(vehicle: Vehicle, item: CargoItem) -> tuple[bool, str]:
+    """Araç (kamyon + varsa römork) kasalarından en az birine tek başına sığar mı?"""
+    reasons = []
+    for body in vehicle.bodies:
+        ok, why = fits_empty(body, item)
+        if ok:
+            return True, ""
+        reasons.append(why)
+    return False, reasons[0]
 
 
 class _Packer:
@@ -157,6 +185,8 @@ class _Packer:
 
     # -- kontroller ------------------------------------------------------------
     def _incompat_mask(self, item: CargoItem) -> np.ndarray:
+        if not self.rules.incompatible or not item.group_key:
+            return np.zeros(len(self.placed), dtype=bool)
         return np.array([self.rules.are_incompatible(item, p.item) for p in self.placed], dtype=bool)
 
     def _check(self, item: CargoItem, rank: float, b, relax_access=False, relax_stack=False,
@@ -205,8 +235,7 @@ class _Packer:
             add[j] = add.get(j, 0.0) + w
             stack += [(k, w * sh) for k, sh in self.supporters[j]]
         for j, w in add.items():
-            lim = self.placed[j].item.max_top_load
-            if lim is not None and self.load_on[j] + w > lim + 1e-6:
+            if self.load_on[j] + w > self.placed[j].item.top_load_limit + 1e-6:
                 return False
         return True
 
@@ -252,7 +281,7 @@ class _Packer:
         cap = np.full(n, np.inf)
         for j in sorted(range(n), key=lambda k: self.placed[k].z):
             it = self.placed[j].item
-            c = np.inf if it.max_top_load is None else it.max_top_load - self.load_on[j]
+            c = it.top_load_limit - self.load_on[j]
             for k, sh in self.supporters[j]:
                 c = min(c, cap[k] / sh if sh > EPS else np.inf)
             cap[j] = max(c, 0.0)
@@ -283,7 +312,6 @@ class _Packer:
             pts = sorted(set(pts) | extra, key=key)
         if not pts:
             return None
-        P = np.array(pts, dtype=float)
         obs = self._obstacles()
         # İstif kurallarına göre üzerine konulabilecek yükler (ön eleme için)
         if relax_stack:
@@ -296,6 +324,30 @@ class _Packer:
             if self.rules.allow_mixed_stop_stacking and self.rules.mode != "FIFO":
                 same |= self.ranks > rank + EPS  # yeni yük daha önce iner: üstte durabilir
             eligible &= same
+        # Aday noktalar öncelik sırasıyla parça parça işlenir; iyi konum genellikle
+        # ilk parçalarda bulunduğundan bütün noktaları süzmek gerekmez.
+        CHUNK = 128
+        for start in range(0, len(pts), CHUNK):
+            chunk = pts[start:start + CHUNK]
+            res = self._search_chunk(item, rank, chunk, ors, obs, eligible, incompat,
+                                     relax_access, relax_stack, relax_seg)
+            if res is not None:
+                return res
+        return None
+
+    def _search_chunk(self, item, rank, pts, ors, obs, eligible, incompat, relax_access, relax_stack, relax_seg):
+        P = np.array(pts, dtype=float)
+        # Yalnız bu noktaların çevresindeki kutular çakışabilir veya destek olabilir.
+        reach = np.max(np.array([o[:3] for o in ors]), axis=0)
+        lo_r, hi_r = P.min(axis=0), P.max(axis=0) + reach
+        if obs.shape[0]:
+            obs = obs[(obs[:, 3] > lo_r[0]) & (obs[:, 0] < hi_r[0]) & (obs[:, 4] > lo_r[1]) & (obs[:, 1] < hi_r[1])
+                      & (obs[:, 5] > lo_r[2]) & (obs[:, 2] < hi_r[2])]
+        B_all = self.boxes
+        near = np.nonzero((B_all[:, 3] > lo_r[0]) & (B_all[:, 0] < hi_r[0]) & (B_all[:, 4] > lo_r[1])
+                          & (B_all[:, 1] < hi_r[1]) & (B_all[:, 5] >= lo_r[2] - 1e-4)
+                          & (B_all[:, 5] <= P[:, 2].max() + 1e-4))[0]
+        B, elig_near, cap_near = B_all[near], eligible[near], self.cap_chain[near]
         # Ön eleme (vektörel): kasa sınırı ve çakışma. Kalan adaylar tam kontrolden geçer.
         cand = np.zeros((len(pts), len(ors)), dtype=bool)
         for k, (dx, dy, dz, _) in enumerate(ors):
@@ -309,10 +361,9 @@ class _Packer:
             # Havadaki noktalar: temas alanı toplamı asgari destek oranının altındaysa ele.
             air = np.nonzero(ok & (P[:, 2] > EPS))[0]
             if air.size:
-                if not eligible.any():
+                if not elig_near.any():
                     ok[air] = False
                 else:
-                    B = self.boxes
                     lo, h2 = P[air], hi[air]
                     top = np.abs(B[None, :, 5] - lo[:, None, 2]) < 1e-4
                     ox = np.clip(np.minimum(B[None, :, 3], h2[:, None, 0]) - np.maximum(B[None, :, 0], lo[:, None, 0]), 0, None)
@@ -321,9 +372,9 @@ class _Packer:
                     total = A.sum(axis=1)
                     bad = total + 1e-6 < self.rules.min_support_ratio * dx * dy
                     if not relax_stack:
-                        bad |= A[:, ~eligible].sum(axis=1) > EPS
+                        bad |= A[:, ~elig_near].sum(axis=1) > EPS
                         share = A / np.maximum(total, EPS)[:, None]
-                        bad |= (item.unit_weight * share > self.cap_chain[None, :] + 1e-6).any(axis=1)
+                        bad |= (item.unit_weight * share > cap_near[None, :] + 1e-6).any(axis=1)
                     ok[air[bad]] = False
             cand[:, k] = ok
         for i in np.nonzero(cand.any(axis=1))[0]:
@@ -442,6 +493,8 @@ def _diagnose(pk: _Packer, item: CargoItem, rank: float) -> str:
     return NO_SPACE
 
 
+
+
 # ----------------------------------------------------------------------------
 # Metrikler ve plan seçimi
 # ----------------------------------------------------------------------------
@@ -450,6 +503,7 @@ def compute_metrics(plan: VehiclePlan, wa: Optional[dict] = None) -> dict:
     v = plan.vehicle
     vol = sum(p.volume for p in plan.placements)
     w = sum(p.weight for p in plan.placements)
+    floor_area = sum(p.dx * p.dy for p in plan.placements if p.z < EPS)
     m = {
         "placed_count": len(plan.placements),
         "unplaced_count": len(plan.unplaced),
@@ -458,6 +512,8 @@ def compute_metrics(plan: VehiclePlan, wa: Optional[dict] = None) -> dict:
         "volume_util": vol / v.volume_cm3 if v.volume_cm3 else 0.0,
         "weight_util": w / v.max_payload_kg if v.max_payload_kg else 0.0,
         "used_length_cm": max((p.x1 for p in plan.placements), default=0.0),
+        # Yükleme metresi: kaplanan taban alanının 2,40 m standart genişliğe bölünmesi
+        "ldm": floor_area / LDM_REFERENCE_WIDTH_CM / 100.0,
         "stacked_count": sum(1 for p in plan.placements if p.z > EPS),
         "max_height_cm": max((p.z1 for p in plan.placements), default=0.0),
         "error_count": len(plan.errors),
@@ -492,6 +548,7 @@ def finalize_plan(plan: VehiclePlan, rules: Rules, detailed_sequence: bool = Fal
 def plan_single_vehicle(vehicle: Vehicle, units: list[CargoUnit], rules: Rules,
                         strategies: Optional[list[Strategy]] = None, objective: str = "min_arac",
                         diagnose: bool = True) -> VehiclePlan:
+    """Tek bir kasa için stratejileri dener, en iyisini döndürür."""
     strategies = strategies or default_strategies(mode=rules.mode)
     best, best_st = None, None
     for st in strategies:
@@ -504,52 +561,139 @@ def plan_single_vehicle(vehicle: Vehicle, units: list[CargoUnit], rules: Rules,
     return best
 
 
-def plan_fleet(vehicle: Vehicle, items: list[CargoItem], rules: Rules, max_vehicles: int = 5,
-               strategies: Optional[list[Strategy]] = None, objective: str = "min_arac") -> FleetPlan:
-    """Aynı tip araçtan gerektiği kadar (en fazla ``max_vehicles``) kullanarak planlar."""
-    units = expand_units(items)
-    fleet = FleetPlan(vehicle=vehicle)
-    remaining: list[CargoUnit] = []
-    for u in units:
-        ok, why = fits_empty(vehicle, u.item)
-        if ok:
-            remaining.append(u)
-        else:
-            fleet.unplaced.append(UnplacedUnit(u.uid, u.item, why, "tekil"))
-    last_plan, last_units, last_diag = None, remaining, False
-    while remaining and len(fleet.plans) < max_vehicles:
-        last = len(fleet.plans) == max_vehicles - 1
-        plan = plan_single_vehicle(vehicle, remaining, rules, strategies, objective, diagnose=last)
-        last_plan, last_units, last_diag = plan, remaining, last
-        if not plan.placements:
-            break
-        fleet.plans.append(plan)
+def plan_unit(vehicle: Vehicle, units: list[CargoUnit], rules: Rules, strategies: Optional[list[Strategy]],
+              objective: str, diagnose: bool, unit_no: int) -> tuple[list[VehiclePlan], list[CargoUnit]]:
+    """Bir aracı (kamyon + varsa römork) doldurur. (kasa planları, kalan yükler)."""
+    plans: list[VehiclePlan] = []
+    remaining = units
+    for body in vehicle.bodies:
+        plan = plan_single_vehicle(body, remaining, rules, strategies, objective, diagnose)
+        plan.unit_no, plan.unit_name, plan.unit_cost = unit_no, vehicle.name, vehicle.trip_cost
+        plans.append(plan)
         placed = {p.uid for p in plan.placements}
         remaining = [u for u in remaining if u.uid not in placed]
-    if remaining:
-        if last_plan is not None and not last_diag:
-            last_plan = plan_single_vehicle(vehicle, last_units, rules, strategies, objective, diagnose=True)
-        reasons = {x.uid: x.reason for x in last_plan.unplaced} if last_plan else {}
-        limit_hit = len(fleet.plans) >= max_vehicles
-        prefix = f"{max_vehicles} araç sınırına ulaşıldı. " if limit_hit else "Boş araçta bile yerleşmiyor (kurallar nedeniyle). "
-        for u in remaining:
-            fleet.unplaced.append(UnplacedUnit(u.uid, u.item, prefix + reasons.get(u.uid, NO_SPACE), "birlikte"))
-    # Ara araçların "yerleşmeyen" listeleri sonraki araçlara aktarıldı; temizle.
-    # Seçilen planlar için okunur (tek tek) yükleme sırası hesaplanır.
+    return plans, remaining
+
+
+def center_partial_load(plan: VehiclePlan, rules: Rules) -> float:
+    """Kısmi yükü kapıya doğru kaydırarak ağırlık merkezini kasa ortasına yaklaştırır.
+
+    Bütün yükler aynı miktar kaydırılır (yerleşim düzeni ve erişim korunur).
+    Kaydırma yeni bir ihlal doğurursa daha küçük adım denenir, olmazsa geri alınır.
+    Kaydırılan mesafeyi (cm) döndürür.
+    """
+    pls = plan.placements
+    total = sum(p.weight for p in pls)
+    if total <= 0:
+        return 0.0
+    v = plan.vehicle
+    cx = sum(p.weight * (p.x + p.dx / 2) for p in pls) / total
+    clearance = rules.rear_clearance_cm if any(d.kind == "arka" for d in v.doors) else 0.0
+    room = v.length - clearance - max(p.x1 for p in pls)
+    delta = min(v.length / 2 - cx, room)
+    if delta < 10:
+        return 0.0
+    base_errors = len([x for x in verify_plan(v, pls, rules)[0] if x.severity == "hata"])
+    for step in (delta, delta / 2, delta / 4):
+        step = float(int(step))  # tam santimetre
+        if step < 10:
+            break
+        for p in pls:
+            p.x += step
+        errors = len([x for x in verify_plan(v, pls, rules)[0] if x.severity == "hata"])
+        if errors <= base_errors:
+            return step
+        for p in pls:
+            p.x -= step
+    return 0.0
+
+
+def _finish_fleet(fleet: FleetPlan, units: list[CargoUnit], rules: Rules) -> FleetPlan:
+    """Ara listeleri temizler, (isteğe bağlı) kısmi yükü ortalar, son doğrulamayı yapar."""
     for p in fleet.plans:
         p.unplaced = []
+        if rules.center_partial_load and p.placements:
+            center_partial_load(p, rules)
+        # Seçilen planlar için okunur (tek tek) yükleme sırası hesaplanır.
         finalize_plan(p, rules, detailed_sequence=True)
+    fleet.notes = split_stop_notes(fleet)
     fleet.metrics = fleet_metrics(fleet, units)
     return fleet
 
 
+def split_stops(fleet: FleetPlan) -> dict[int, list[int]]:
+    """Birden fazla araca bölünmüş teslimat durakları: {durak: [araç no, ...]}."""
+    where: dict[int, set[int]] = {}
+    for p in fleet.plans:
+        for q in p.placements:
+            where.setdefault(q.item.delivery_stop, set()).add(p.unit_no)
+    return {s: sorted(u) for s, u in sorted(where.items()) if len(u) > 1}
+
+
+def split_stop_notes(fleet: FleetPlan) -> list[str]:
+    return [f"{s}. durağın yükleri {len(u)} araca bölündü (Araç {', '.join(map(str, u))}). "
+            "Teslimatta her araç bu durağa uğramalı." for s, u in split_stops(fleet).items()]
+
+
+def plan_fleet(vehicle: Vehicle, items: list[CargoItem], rules: Rules, max_vehicles: int = 5,
+               strategies: Optional[list[Strategy]] = None, objective: str = "min_arac",
+               keep_stops: bool = False) -> FleetPlan:
+    """Aynı tip araçtan gerektiği kadar (en fazla ``max_vehicles``) kullanarak planlar.
+
+    ``keep_stops=True``: bir araçta yarım kalan teslimat duraklarının yükleri o
+    araçtan çıkarılıp sonraki araca bırakılır (müşteri yükü araçlara bölünmesin).
+    """
+    units = expand_units(items)
+    fleet = FleetPlan(vehicle=vehicle)
+    remaining: list[CargoUnit] = []
+    for u in units:
+        ok, why = fits_vehicle(vehicle, u.item)
+        if ok:
+            remaining.append(u)
+        else:
+            fleet.unplaced.append(UnplacedUnit(u.uid, u.item, why, "tekil"))
+    last_plans, last_units, last_diag = None, remaining, False
+    unit_no = 0
+    while remaining and unit_no < max_vehicles:
+        last = unit_no == max_vehicles - 1
+        plans, rest = plan_unit(vehicle, remaining, rules, strategies, objective, last, unit_no + 1)
+        if keep_stops and rest and not last:
+            placed_stops = {q.item.delivery_stop for p in plans for q in p.placements}
+            partial = placed_stops & {u.item.delivery_stop for u in rest}
+            whole = [u for u in remaining if u.item.delivery_stop in placed_stops - partial]
+            if partial and whole:
+                plans2, rest2 = plan_unit(vehicle, whole, rules, strategies, objective, False, unit_no + 1)
+                if any(p.placements for p in plans2):
+                    placed2 = {q.uid for p in plans2 for q in p.placements}
+                    plans, rest = plans2, [u for u in remaining if u.uid not in placed2]
+        last_plans, last_units, last_diag = plans, remaining, last
+        if not any(p.placements for p in plans):
+            break
+        fleet.plans += plans
+        remaining = rest
+        unit_no += 1
+    if remaining:
+        if last_plans is not None and not last_diag:
+            last_plans, _ = plan_unit(vehicle, last_units, rules, strategies, objective, True, unit_no)
+        reasons = {x.uid: x.reason for x in last_plans[-1].unplaced} if last_plans else {}
+        limit_hit = unit_no >= max_vehicles
+        prefix = f"{max_vehicles} araç sınırına ulaşıldı. " if limit_hit else "Boş araçta bile yerleşmiyor (kurallar nedeniyle). "
+        for u in remaining:
+            fleet.unplaced.append(UnplacedUnit(u.uid, u.item, prefix + reasons.get(u.uid, NO_SPACE), "birlikte"))
+    return _finish_fleet(fleet, units, rules)
+
+
 def fleet_metrics(fleet: FleetPlan, units: list[CargoUnit]) -> dict:
-    v = fleet.vehicle
-    n = max(fleet.n_vehicles, 1)
     vol = sum(p.metrics["placed_volume_m3"] for p in fleet.plans)
     w = sum(p.metrics["placed_weight_kg"] for p in fleet.plans)
+    cap_vol = sum(p.vehicle.volume_cm3 for p in fleet.plans)
+    cap_w = sum(p.vehicle.max_payload_kg for p in fleet.plans)
     total_w = sum(u.item.unit_weight for u in units)
     total_vol = sum(u.item.unit_volume_cm3 for u in units) / 1e6
+    costs = {p.unit_no: p.unit_cost for p in fleet.plans}
+    total_cost = sum(costs.values()) if costs and all(c is not None for c in costs.values()) else None
+    v = fleet.vehicle
+    single = not fleet.mixed
     return {
         "n_vehicles": fleet.n_vehicles,
         "total_units": len(units),
@@ -560,39 +704,168 @@ def fleet_metrics(fleet: FleetPlan, units: list[CargoUnit]) -> dict:
         "total_volume_m3": total_vol,
         "placed_weight_kg": w,
         "placed_volume_m3": vol,
-        "volume_util": vol * 1e6 / (v.volume_cm3 * n),
-        "weight_util": w / (v.max_payload_kg * n),
+        "capacity_volume_m3": cap_vol / 1e6,
+        "volume_util": vol * 1e6 / cap_vol if cap_vol else 0.0,
+        "weight_util": w / cap_w if cap_w else 0.0,
+        "ldm": sum(p.metrics.get("ldm", 0.0) for p in fleet.plans),
+        "total_cost": total_cost,
+        "split_stops": len(split_stops(fleet)),
         "error_count": sum(p.metrics["error_count"] for p in fleet.plans),
         "access_violations": sum(p.metrics["access_violations"] for p in fleet.plans),
         "stacked_count": sum(p.metrics["stacked_count"] for p in fleet.plans),
-        "min_by_weight": math.ceil(total_w / v.max_payload_kg) if v.max_payload_kg else None,
-        "min_by_volume": math.ceil(total_vol * 1e6 / v.volume_cm3) if v.volume_cm3 else None,
+        "min_by_weight": math.ceil(total_w / v.total_payload_kg) if single and v.total_payload_kg else None,
+        "min_by_volume": math.ceil(total_vol * 1e6 / v.total_volume_cm3) if single and v.total_volume_cm3 else None,
     }
 
 
 def fleet_score(fleet: FleetPlan, objective: str) -> tuple:
     m = fleet.metrics
-    cap = fleet.vehicle.volume_cm3 * max(fleet.n_vehicles, 1)
+    cap = round(m["capacity_volume_m3"], 1)
+    cost = m["total_cost"] if m["total_cost"] is not None else math.inf
     base = (m["unplaced_count"], m["error_count"])
+    if objective == "min_maliyet":
+        return base + (cost, m["n_vehicles"], cap)
     if objective == "max_hacim":
-        return base + (-round(m["volume_util"], 3), m["n_vehicles"], cap)
+        return base + (-round(m["volume_util"], 3), m["n_vehicles"], cost)
     if objective == "kolay_bosaltma":
-        return base + (m["access_violations"], m["n_vehicles"], m["stacked_count"], cap)
-    return base + (m["n_vehicles"], cap, -m["volume_util"])
+        return base + (m["access_violations"], m["split_stops"], m["n_vehicles"], m["stacked_count"], cap)
+    return base + (m["n_vehicles"], cost, cap, m["split_stops"])
+
+
+def screen_strategies(mode: str) -> list[Strategy]:
+    """Ön eleme için hızlı strateji seti."""
+    return default_strategies("hizli", mode)
+
+
+def _best_fleet(vehicle: Vehicle, items: list[CargoItem], rules: Rules, n: int, strategies, objective: str) -> FleetPlan:
+    """Tek tip filo; duraklar araçlara bölündüyse durakları bölmeyen varyantı da dener."""
+    f = plan_fleet(vehicle, items, rules, n, strategies, objective)
+    if f.metrics["split_stops"] and f.n_vehicles > 1:
+        g = plan_fleet(vehicle, items, rules, n, strategies, objective, keep_stops=True)
+        better = (g.metrics["unplaced_count"], g.metrics["error_count"], g.n_vehicles, g.metrics["split_stops"]) < \
+                 (f.metrics["unplaced_count"], f.metrics["error_count"], f.n_vehicles, f.metrics["split_stops"])
+        if better:
+            return g
+    return f
+
+
+def plan_mixed_fleet(vehicles: list[Vehicle], availability: dict[str, int], items: list[CargoItem], rules: Rules,
+                     objective: str, screen: list[Strategy], full: list[Strategy]) -> Optional[FleetPlan]:
+    """Eldeki farklı tip araçlarla açgözlü (greedy) karma filo planı.
+
+    Her adımda kalan yükün tamamını taşıyabilen araçlardan en uygunu (maliyet
+    biliniyorsa en ucuz, değilse en küçük) seçilir; hiçbiri tamamını alamıyorsa
+    kalan yükün en büyük kısmını (maliyete oranla) taşıyan araç seçilir.
+    """
+    usable = [v for v in vehicles if availability.get(v.id, 0) > 0]
+    if len(usable) < 2:
+        return None
+    units = expand_units(items)
+    fleet = FleetPlan(vehicle=usable[0], mixed=True)
+    remaining = []
+    for u in units:
+        if any(fits_vehicle(v, u.item)[0] for v in usable):
+            remaining.append(u)
+        else:
+            fleet.unplaced.append(UnplacedUnit(u.uid, u.item, fits_vehicle(usable[0], u.item)[1] +
+                                               " (eldeki hiçbir araca tek başına sığmıyor)", "tekil"))
+    counts = {v.id: availability.get(v.id, 0) for v in usable}
+    use_cost = objective == "min_maliyet" and all(v.trip_cost is not None for v in usable)
+    unit_no = 0
+    while remaining:
+        rem_w = sum(u.item.unit_weight for u in remaining) or 1.0
+        rem_v = sum(u.item.unit_volume_cm3 for u in remaining) or 1.0
+        cands = []
+        for v in usable:
+            if counts[v.id] <= 0:
+                continue
+            plans, rest = plan_unit(v, remaining, rules, screen, objective, False, 0)
+            if len(rest) == len(remaining):
+                continue
+            rest_ids = {u.uid for u in rest}
+            pw = sum(u.item.unit_weight for u in remaining if u.uid not in rest_ids)
+            pv = sum(u.item.unit_volume_cm3 for u in remaining if u.uid not in rest_ids)
+            cov = 0.5 * (pw / rem_w + pv / rem_v)
+            cost = v.trip_cost if use_cost else None
+            cands.append((v, not rest, cov, cost))
+        if not cands:
+            break
+        complete = [c for c in cands if c[1]]
+        if complete:
+            key = (lambda c: (c[3], c[0].total_volume_cm3)) if use_cost else (lambda c: (c[0].total_volume_cm3,))
+            chosen = min(complete, key=key)[0]
+        else:
+            key = (lambda c: (-c[2] / max(c[3], 1e-9), c[0].total_volume_cm3)) if use_cost else \
+                  (lambda c: (-round(c[2], 3), c[0].total_volume_cm3))
+            chosen = min(cands, key=key)[0]
+        plans, rest = plan_unit(chosen, remaining, rules, full, objective, False, unit_no + 1)
+        if not any(p.placements for p in plans):
+            break
+        fleet.plans += plans
+        remaining = rest
+        counts[chosen.id] -= 1
+        unit_no += 1
+    for u in remaining:
+        fleet.unplaced.append(UnplacedUnit(u.uid, u.item, "Eldeki araç adetleri yetmedi veya yük kalan araçlara "
+                                                          "kurallara uygun yerleşmedi.", "birlikte"))
+    if len({p.unit_name for p in fleet.plans}) < 2:
+        return None  # tek tip araç kullanıldı; tek tip seçeneklerle aynı
+    return _finish_fleet(fleet, units, rules)
 
 
 def compare_vehicles(vehicles: list[Vehicle], items: list[CargoItem], rules: Rules, objective: str = "min_arac",
-                     max_vehicles: int = 5, depth: str = "normal") -> list[FleetPlan]:
-    strategies = default_strategies(depth, rules.mode)
+                     max_vehicles: int = 5, depth: str = "normal",
+                     availability: Optional[dict[str, int]] = None, allow_mixed: bool = True,
+                     progress: Optional[Callable[[float, str], None]] = None) -> list[FleetPlan]:
+    """Araç seçeneklerini karşılaştırır.
+
+    1. Bütün araç tipleri hızlı strateji setiyle taranır.
+    2. En iyi 3 seçenek (kapsamlı aramada hepsi) tam strateji setiyle yeniden planlanır.
+    3. Tek tip araç bütün yükü tek araçla taşıyamıyorsa eldeki araçlarla karma filo denenir.
+    """
+    avail = {v.id: (availability or {}).get(v.id, max_vehicles) for v in vehicles}
+    screen = screen_strategies(rules.mode)
+    full = default_strategies(depth, rules.mode)
+    report = progress or (lambda frac, text: None)
+    active = [v for v in vehicles if avail[v.id] > 0]
     fleets = []
-    for v in vehicles:
-        f = plan_fleet(v, items, rules, max_vehicles, strategies, objective)
+    for i, v in enumerate(active):
+        report(0.6 * i / max(len(active), 1), f"Ön eleme: {v.name}")
+        f = plan_fleet(v, items, rules, avail[v.id], screen, objective)
         f.score = fleet_score(f, objective)
         fleets.append(f)
     fleets.sort(key=lambda f: f.score)
+    k = len(fleets) if depth == "kapsamli" else 3
+    refined = []
+    for i, f in enumerate(fleets[:k]):
+        report(0.6 + 0.3 * i / max(min(k, len(fleets)), 1), f"Ayrıntılı yerleşim: {f.vehicle.name}")
+        g = _best_fleet(f.vehicle, items, rules, avail[f.vehicle.id], full, objective)
+        g.score = fleet_score(g, objective)
+        refined.append(g)
+    fleets = refined + fleets[k:]
+    best = min(fleets, key=lambda f: f.score) if fleets else None
+    needs_mixed = best is None or best.n_vehicles > 1 or best.metrics["unplaced_count"] > 0 or objective == "min_maliyet"
+    if allow_mixed and needs_mixed and len(active) > 1:
+        report(0.9, "Karma filo deneniyor")
+        mf = plan_mixed_fleet(vehicles, avail, items, rules, objective, screen, full)
+        if mf is not None:
+            mf.score = fleet_score(mf, objective)
+            fleets.append(mf)
+    fleets.sort(key=lambda f: f.score)
     if fleets:
         fleets[0].explanation = explain_choice(fleets, objective)
+    report(1.0, "Tamamlandı")
     return fleets
+
+
+def fmt_num(x: float, digits: int = 0) -> str:
+    """Türkçe sayı biçimi: binlik ayırıcı nokta, ondalık virgül."""
+    s = f"{x:,.{digits}f}"
+    return s.replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def _cost_text(m: dict) -> str:
+    return f"{fmt_num(m['total_cost'])} TL" if m.get("total_cost") is not None else "girilmedi"
 
 
 def explain_choice(fleets: list[FleetPlan], objective: str) -> str:
@@ -602,18 +875,28 @@ def explain_choice(fleets: list[FleetPlan], objective: str) -> str:
     m = best.metrics
     parts = [f"Hedef: {OBJECTIVES.get(objective, objective)}."]
     if m["unplaced_count"] == 0:
-        parts.append(f"Tüm {m['total_units']} yük {m['n_vehicles']} adet {best.vehicle.name} ile yerleştirildi.")
+        parts.append(f"Tüm {m['total_units']} yük {best.label} ile yerleştirildi.")
     else:
         parts.append(f"{m['total_units']} yükten {m['unplaced_count']} tanesi hiçbir denemede yerleştirilemedi; "
-                     "bu araç en az yerleşmeyen yükü bırakan seçenek.")
-    parts.append(f"Hacim kullanımı %{100 * m['volume_util']:.0f}, ağırlık kapasitesi kullanımı %{100 * m['weight_util']:.0f}.")
+                     "bu seçenek en az yerleşmeyen yükü bırakıyor.")
+    parts.append(f"Hacim kullanımı %{100 * m['volume_util']:.0f}, ağırlık kapasitesi kullanımı %{100 * m['weight_util']:.0f}, "
+                 f"yükleme metresi {fmt_num(m['ldm'], 1)} LDM.")
+    if m.get("total_cost") is not None:
+        parts.append(f"Sefer maliyeti: {_cost_text(m)}.")
+    elif objective == "min_maliyet":
+        parts.append("Bazı araçların sefer maliyeti girilmediği için maliyete göre sıralama yapılamadı; "
+                     "araç sayısı ve kapasiteye göre sıralandı.")
+    if best.mixed:
+        parts.append("Bu bir karma filo önerisidir (eldeki farklı araç tipleri birlikte kullanıldı).")
     if m["error_count"]:
         parts.append(f"DİKKAT: planda {m['error_count']} kural ihlali var.")
     others = [f for f in fleets[1:] if f.metrics["unplaced_count"] == 0]
     if others:
         o = others[0]
-        parts.append(f"En yakın alternatif: {o.vehicle.name} ({o.metrics['n_vehicles']} araç, "
-                     f"hacim %{100 * o.metrics['volume_util']:.0f}).")
-    if best.vehicle.is_demo:
+        alt = f"En yakın alternatif: {o.label} (hacim %{100 * o.metrics['volume_util']:.0f}"
+        if o.metrics.get("total_cost") is not None:
+            alt += f", {_cost_text(o.metrics)}"
+        parts.append(alt + ").")
+    if any(p.vehicle.is_demo for p in best.plans):
         parts.append("Not: araç ölçüleri DEMO değerdir; gerçek araç verisiyle doğrulayın.")
     return " ".join(parts)

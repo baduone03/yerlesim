@@ -3,98 +3,65 @@
 UYARI: Buradaki ölçü ve kapasiteler Türkiye'de yaygın araç sınıfları için
 yaklaşık, temsili değerlerdir. Üretici verisi DEĞİLDİR. Aynı sınıftaki araçlar
 arasında model, şasi, kasa üreticisi ve üst yapıya göre ciddi farklar olur.
-Gerçek planlamada aracın ruhsatı / teknik belgesi ve kasa üreticisinin
-verdiği iç ölçüler girilmelidir. Aks yük limitleri bilinmediği için demo
-profillerde boş bırakılmıştır (aks kontrolü yapılmaz).
+Gerçek planlamada aracın ruhsatı / teknik belgesindeki istiap haddi ve kasa
+üreticisinin verdiği iç ölçüler girilmelidir. Aks yük limitleri bilinmediği
+için demo profillerde boş bırakılmıştır (aks kontrolü yapılmaz). Sefer
+maliyeti de boştur; kullanıcı kendi navlun fiyatını girer.
 """
 
 from __future__ import annotations
 
 import copy
 
-from .models import AxleConfig, Door, Vehicle, Zone
+from .models import AxleConfig, Door, Vehicle, Zone, doors_for_body
 
-_DEMO_NOTE = "DEMO değer - gerçek araç ölçüsü ve ruhsattaki kapasite ile değiştirin."
+_DEMO_NOTE = "DEMO değer - gerçek araç ölçüsü ve ruhsattaki istiap haddi ile değiştirin."
+
+
+def _v(id, name, category, L, W, H, payload, body="kapali", **kw) -> Vehicle:
+    kw.setdefault("doors", doors_for_body(body, L))
+    kw.setdefault("notes", _DEMO_NOTE)
+    return Vehicle(id=id, name=name, category=category, length=L, width=W, height=H,
+                   max_payload_kg=payload, body_type=body, **kw)
 
 
 def _profiles() -> list[Vehicle]:
     return [
-        Vehicle(
-            id="panelvan",
-            name="Panelvan / hafif ticari araç",
-            category="Hafif ticari",
-            length=260,
-            width=170,
-            height=140,
-            max_payload_kg=1000,
-            doors=[Door("arka", width=150, height=130), Door("yan_sag", x_start=20, x_end=120, height=125)],
-            zones=[
-                Zone("Sol teker davlumbazı", 150, 0, 0, 90, 24, 30, True),
-                Zone("Sağ teker davlumbazı", 150, 146, 0, 90, 24, 30, True),
-            ],
-            axles=AxleConfig(front_x=-90, rear_x=195),
-            notes=_DEMO_NOTE,
-        ),
-        Vehicle(
-            id="orta_kamyonet",
-            name="Orta boy kapalı kasa kamyonet",
-            category="Kamyonet (~3,5-7,5 t)",
-            length=420,
-            width=205,
-            height=210,
-            max_payload_kg=3500,
-            doors=[Door("arka")],
-            axles=AxleConfig(front_x=-110, rear_x=260),
-            notes=_DEMO_NOTE,
-        ),
-        Vehicle(
-            id="buyuk_kamyonet",
-            name="Büyük kapalı kasa kamyonet",
-            category="Kamyonet (~8-12 t)",
-            length=620,
-            width=240,
-            height=240,
-            max_payload_kg=6000,
-            doors=[Door("arka")],
-            axles=AxleConfig(front_x=-120, rear_x=400),
-            notes=_DEMO_NOTE,
-        ),
-        Vehicle(
-            id="on_teker",
-            name="10 teker kamyon",
-            category="Kamyon (6x2 / 6x4)",
-            length=850,
-            width=245,
-            height=260,
-            max_payload_kg=15000,
-            doors=[Door("arka")],
-            axles=AxleConfig(front_x=-130, rear_x=560, rear_label="Arka tandem aks"),
-            notes=_DEMO_NOTE,
-        ),
-        Vehicle(
-            id="yari_romork",
-            name="13,60 m tenteli / kapalı yarı römork",
-            category="Çekici + yarı römork",
-            length=1360,
-            width=245,
-            height=270,
-            max_payload_kg=24000,
-            doors=[Door("arka")],
-            axles=AxleConfig(front_x=120, rear_x=1060, front_label="Şasi pimi (king pin)", rear_label="Römork aks grubu"),
-            notes=_DEMO_NOTE + " Tenteli araçta yan erişim için yan kapı tanımlanabilir.",
-        ),
-        Vehicle(
-            id="ozel",
-            name="Özel araç (kullanıcı tanımlı)",
-            category="Kullanıcı tanımlı",
-            length=400,
-            width=200,
-            height=200,
-            max_payload_kg=2000,
-            doors=[Door("arka")],
-            is_demo=False,
-            notes="Ölçüleri ve kapasiteyi kendi aracınıza göre girin.",
-        ),
+        _v("panelvan", "Panelvan / hafif ticari araç", "Hafif ticari", 260, 170, 140, 1000, "ozel",
+           doors=[Door("arka", width=150, height=130), Door("yan_sag", x_start=20, x_end=120, height=125)],
+           zones=[Zone("Sol teker davlumbazı", 150, 0, 0, 90, 24, 30, True),
+                  Zone("Sağ teker davlumbazı", 150, 146, 0, 90, 24, 30, True)],
+           axles=AxleConfig(front_x=-90, rear_x=195)),
+        _v("orta_kamyonet", "Orta boy kapalı kasa kamyonet", "Kamyonet (~7,5 t)", 420, 205, 210, 3500,
+           axles=AxleConfig(front_x=-110, rear_x=260)),
+        _v("buyuk_kamyonet", "Büyük kapalı kasa kamyonet", "Kamyonet (~8-12 t)", 620, 240, 240, 6000,
+           axles=AxleConfig(front_x=-120, rear_x=400)),
+        _v("on_teker", "10 teker kamyon (kapalı kasa)", "Kamyon 6x2, 3 akslı", 850, 245, 260, 15000,
+           axles=AxleConfig(front_x=-130, rear_x=560, rear_label="Arka tandem aks")),
+        _v("kirkayak", "Kırkayak (12 teker) tenteli kamyon", "Kamyon 8x2, 4 akslı", 980, 248, 270, 19000, "tenteli",
+           axles=AxleConfig(front_x=-60, rear_x=700, front_label="Ön aks grubu", rear_label="Arka tandem aks")),
+        _v("yari_romork", "Tenteli dorse 13,60 m", "Çekici + yarı römork", 1360, 248, 270, 24000, "tenteli",
+           axles=AxleConfig(front_x=120, rear_x=1060, front_label="Şasi pimi (king pin)", rear_label="Dorse aks grubu"),
+           notes=_DEMO_NOTE + " Tente açılınca iki yandan forkliftle yükleme/boşaltma yapılabilir."),
+        _v("mega_dorse", "Mega tenteli dorse 13,60 m", "Çekici + yarı römork (mega)", 1360, 248, 300, 24000, "tenteli",
+           axles=AxleConfig(front_x=120, rear_x=1060, front_label="Şasi pimi (king pin)", rear_label="Dorse aks grubu"),
+           notes=_DEMO_NOTE + " Mega dorsede iç yükseklik ~3 m'dir; hacimli, hafif yükler için uygundur."),
+        _v("kapali_dorse", "Kapalı (kutu) dorse 13,60 m", "Çekici + yarı römork", 1360, 248, 265, 23000,
+           axles=AxleConfig(front_x=120, rear_x=1060, front_label="Şasi pimi (king pin)", rear_label="Dorse aks grubu")),
+        _v("frigo_dorse", "Frigorifik dorse 13,40 m", "Çekici + soğutmalı yarı römork", 1340, 246, 260, 22000, "frigorifik",
+           axles=AxleConfig(front_x=120, rear_x=1040, front_label="Şasi pimi (king pin)", rear_label="Dorse aks grubu"),
+           notes=_DEMO_NOTE + " Soğuk zincir yükleri yalnız frigorifik araçlara yüklenir."),
+        _v("kamyon_romork", "Kamyon + römork (tenteli, 2 × 7,7 m)", "Kamyon + römork kombinasyonu",
+           770, 248, 270, 11000, "ozel", body_label="Kamyon kasası",
+           doors=[Door("yan_sol", 0.0, 770), Door("yan_sag", 0.0, 770)],
+           axles=AxleConfig(front_x=-130, rear_x=520, rear_label="Kamyon arka aks grubu"),
+           trailer=_v("kamyon_romork_r", "Römork", "Römork", 770, 248, 270, 13000, "tenteli", body_label="Römork",
+                      axles=AxleConfig(front_x=150, rear_x=600, front_label="Römork ön aks", rear_label="Römork arka aks")),
+           notes=_DEMO_NOTE + " Römork bağlıyken kamyon kasasının arka kapısı kullanılamaz; kamyon kasası "
+                              "yalnız yanlardan (tente) yüklenir/boşaltılır. Toplam istiap ~24 t."),
+        Vehicle(id="ozel", name="Özel araç (kullanıcı tanımlı)", category="Kullanıcı tanımlı",
+                length=400, width=200, height=200, max_payload_kg=2000, doors=[Door("arka")],
+                is_demo=False, notes="Ölçüleri ve kapasiteyi kendi aracınıza göre girin."),
     ]
 
 

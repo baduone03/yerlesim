@@ -34,6 +34,7 @@ COLUMNS = {
     "yukleme_onceligi": ("loading_priority", int),
     "notlar": ("notes", str),
     "ayrim_grubu": ("segregation_group", str),
+    "soguk_zincir": ("cold_chain", bool),
 }
 REQUIRED = ["kod", "adet", "boy_cm", "en_cm", "yukseklik_cm", "birim_agirlik_kg"]
 
@@ -147,12 +148,14 @@ def items_to_csv(items: list[CargoItem]) -> str:
     return pd.DataFrame(rows, columns=list(COLUMNS)).to_csv(index=False, sep=";", decimal=",")
 
 
-def placements_dataframe(plan: VehiclePlan, vehicle_no: Optional[int] = None) -> pd.DataFrame:
+def placements_dataframe(plan: VehiclePlan, with_vehicle: bool = False) -> pd.DataFrame:
     rows = []
     for p in sorted(plan.placements, key=lambda q: q.load_step):
         r = {}
-        if vehicle_no is not None:
-            r["arac_no"] = vehicle_no
+        if with_vehicle:
+            r["arac_no"] = plan.unit_no
+            r["arac"] = plan.unit_name or plan.vehicle.name
+            r["kasa"] = plan.vehicle.body_label
         r.update({
             "yukleme_sirasi": p.load_step,
             "bosaltma_sirasi": p.unload_step,
@@ -176,7 +179,7 @@ def placements_dataframe(plan: VehiclePlan, vehicle_no: Optional[int] = None) ->
 
 
 def fleet_placements_csv(fleet: FleetPlan) -> str:
-    frames = [placements_dataframe(p, i + 1) for i, p in enumerate(fleet.plans)]
+    frames = [placements_dataframe(p, with_vehicle=True) for p in fleet.plans if p.placements]
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return df.to_csv(index=False, sep=";", decimal=",")
 

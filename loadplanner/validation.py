@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from .models import CARGO_TYPES, DOOR_KINDS, CargoItem, Vehicle
+from .models import BODY_TYPES, CARGO_TYPES, DOOR_KINDS, CargoItem, Vehicle
 
 MAX_DIM_CM = 2000.0  # bir yük boyutu için makul üst sınır (20 m)
 MAX_QTY = 2000
@@ -68,9 +68,12 @@ def validate_item(item: CargoItem) -> tuple[list[str], list[str]]:
             warnings.append(f"{label}: palet ölçülerinin palet DAHİL dış ölçü olduğundan emin olun.")
         if item.supports_load and item.max_top_load is None:
             warnings.append(
-                f"{label}: üstüne yük konulabilir işaretli ama azami üst yük girilmedi; "
-                "istif dayanımı kontrol edilemeyecek (sınırsız kabul edilir)."
+                f"{label}: üzerine konulabilecek azami ağırlık girilmedi; güvenli tarafta kalmak için kendi "
+                f"ağırlığı ({float(item.unit_weight):.0f} kg) kadar kabul edildi. Ambalaj dayanımını biliyorsanız girin."
             )
+        if item.cargo_type == "palet" and float(item.unit_weight) > 1500:
+            warnings.append(f"{label}: palet başına {float(item.unit_weight):.0f} kg; standart ahşap paletlerin "
+                            "taşıma kapasitesi genellikle 1000-1500 kg'dır. Palet tipini kontrol edin.")
         if item.fragile and item.allow_on_top:
             warnings.append(f"{label}: kırılabilir yükün üstüne yük konulmayacak.")
     return errors, warnings
@@ -122,4 +125,10 @@ def validate_vehicle(v: Vehicle) -> list[str]:
         errors.append(f"{v.name}: aks hesabı için ön ve arka aks konumunun ikisi de girilmelidir.")
     elif a.front_x is not None and a.rear_x <= a.front_x:
         errors.append(f"{v.name}: arka aks konumu ön aks konumundan büyük olmalıdır.")
+    if v.trip_cost is not None and (not _is_number(v.trip_cost) or float(v.trip_cost) < 0):
+        errors.append(f"{v.name}: sefer maliyeti negatif olamaz.")
+    if v.body_type not in BODY_TYPES:
+        errors.append(f"{v.name}: geçersiz kasa tipi '{v.body_type}'.")
+    if v.trailer is not None:
+        errors += [f"{v.name} / römork: " + e.split(": ", 1)[-1] for e in validate_vehicle(v.trailer)]
     return errors

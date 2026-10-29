@@ -35,9 +35,27 @@ RULE_MODES = {
 
 OBJECTIVES = {
     "min_arac": "Minimum araç sayısı",
+    "min_maliyet": "Minimum maliyet",
     "max_hacim": "Maksimum hacim kullanımı",
     "kolay_bosaltma": "Boşaltma kolaylığı",
 }
+
+# Kasa tipi kapıları ve soğutmayı belirler. "ozel": kapılar elle tanımlanır.
+BODY_TYPES = {
+    "kapali": "Kapalı kasa / kutu (yalnız arka kapı)",
+    "tenteli": "Tenteli (arka + iki yandan yükleme)",
+    "frigorifik": "Frigorifik (soğutmalı, arka kapı)",
+    "ozel": "Özel kapı tanımı",
+}
+
+# Hazır palet tabanları (boy, en) cm
+PALLET_PRESETS = {
+    "euro": ("Euro palet 120×80", 120.0, 80.0),
+    "endustriyel": ("Endüstriyel palet 120×100", 120.0, 100.0),
+    "yarim": ("Yarım palet 80×60", 80.0, 60.0),
+}
+
+LDM_REFERENCE_WIDTH_CM = 240.0  # yükleme metresi (LDM) hesabında standart genişlik
 
 
 def normalize_group(name: str) -> str:
@@ -111,8 +129,19 @@ class AxleConfig:
         )
 
 
+def doors_for_body(body_type: str, length: float) -> list[Door]:
+    """Kasa tipine göre varsayılan kapılar."""
+    if body_type == "tenteli":
+        return [Door("arka"), Door("yan_sol", 0.0, length), Door("yan_sag", 0.0, length)]
+    return [Door("arka")]
+
+
 @dataclass
 class Vehicle:
+    """Bir yük kasası. ``trailer`` varsa araç kamyon + römork kombinasyonudur;
+    römork ayrı bir kasa olarak (kendi ölçü, kapı ve kapasitesiyle) planlanır.
+    """
+
     id: str
     name: str
     category: str
@@ -125,10 +154,31 @@ class Vehicle:
     axles: AxleConfig = field(default_factory=AxleConfig)
     is_demo: bool = True
     notes: str = ""
+    body_type: str = "kapali"
+    trailer: Optional["Vehicle"] = None
+    trip_cost: Optional[float] = None  # sefer başı maliyet (TL); bilinmiyorsa None
+    body_label: str = ""  # kombinasyonda kasanın adı, ör. "Kamyon kasası", "Römork"
 
     @property
     def volume_cm3(self) -> float:
         return self.length * self.width * self.height
+
+    @property
+    def refrigerated(self) -> bool:
+        return self.body_type == "frigorifik"
+
+    @property
+    def bodies(self) -> list["Vehicle"]:
+        """Planlanacak kasalar: kamyon (+ varsa römork)."""
+        return [self] + ([self.trailer] if self.trailer is not None else [])
+
+    @property
+    def total_volume_cm3(self) -> float:
+        return sum(b.volume_cm3 for b in self.bodies)
+
+    @property
+    def total_payload_kg(self) -> float:
+        return sum(b.max_payload_kg for b in self.bodies)
 
     def door_size(self, door: Door) -> tuple[float, float]:
         """Kapı açıklığının (genişlik, yükseklik) değeri."""
@@ -167,6 +217,19 @@ class CargoItem:
     loading_priority: int = 1
     notes: str = ""
     segregation_group: str = ""  # ör. "gıda", "kimyasal"; Rules.incompatible ile birlikte kullanılır
+    cold_chain: bool = False  # soğuk zincir: yalnız frigorifik araca yüklenir
+
+    @property
+    def top_load_limit(self) -> float:
+        """Üstüne binebilecek azami ağırlık (kg).
+
+        Değer girilmemişse yükün KENDİ ağırlığı kadar kabul edilir: aynı yükten
+        biri üstüne konabilir ama daha ağır bir yük konamaz (ör. palet koli
+        üstüne). Bu, "sınırsız" varsaymaktan güvenli bir varsayılandır.
+        """
+        if not self.supports_load:
+            return 0.0
+        return float(self.max_top_load) if self.max_top_load is not None else float(self.unit_weight)
 
     @property
     def group_key(self) -> str:
@@ -214,6 +277,9 @@ class Rules:
     allow_mixed_stop_stacking: bool = False
     min_support_ratio: float = 0.75
     rear_clearance_cm: float = 0.0
+    # Kısmi yükte yükü kabinden kapıya doğru kaydırarak ağırlık merkezini kasa
+    # ortasına yaklaştır (önde kalan boşluk takozlanmalıdır).
+    center_partial_load: bool = False
     # Birlikte istiflenemeyen ve arasında en az ``separation_cm`` yatay mesafe
     # bırakılması gereken ayrım grubu çiftleri, ör. (("gıda", "kimyasal"),).
     incompatible: tuple = ()
@@ -305,12 +371,23 @@ class UnplacedUnit:
 
 @dataclass
 class VehiclePlan:
+    """Tek bir kasanın planı. Kamyon + römorkta her kasa ayrı bir plandır;
+    aynı aracın kasaları aynı ``unit_no`` değerini taşır."""
+
     vehicle: Vehicle
     placements: list[Placement] = field(default_factory=list)
     unplaced: list[UnplacedUnit] = field(default_factory=list)
     violations: list[Violation] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     strategy: str = ""
+    unit_no: int = 1
+    unit_name: str = ""  # aracın (profilin) adı; kombinasyonda kamyon+römork adı
+    unit_cost: Optional[float] = None  # aracın sefer maliyeti (aracın her kasasında aynı değer)
+
+    @property
+    def title(self) -> str:
+        body = f" · {self.vehicle.body_label}" if self.vehicle.body_label else ""
+        return f"Araç {self.unit_no}{body}"
 
     @property
     def errors(self) -> list[Violation]:
@@ -327,15 +404,31 @@ class VehiclePlan:
 
 @dataclass
 class FleetPlan:
-    """Bir araç tipiyle (gerekirse birden fazla adet) yapılan planlama sonucu."""
+    """Bir planlama seçeneği: bir araç tipinden bir veya birkaç adet, ya da
+    karma filo (farklı tiplerden araçlar)."""
 
-    vehicle: Vehicle
+    vehicle: Vehicle  # tek tip seçenekte araç tipi; karma filoda ilk araç
     plans: list[VehiclePlan] = field(default_factory=list)
     unplaced: list[UnplacedUnit] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     score: tuple = ()
     explanation: str = ""
+    mixed: bool = False
+    notes: list[str] = field(default_factory=list)  # filo düzeyi uyarılar (ör. bölünen duraklar)
 
     @property
     def n_vehicles(self) -> int:
-        return len(self.plans)
+        return len({p.unit_no for p in self.plans})
+
+    @property
+    def label(self) -> str:
+        if not self.plans:
+            return f"{self.vehicle.name} × 0"
+        names: dict[str, int] = {}
+        order: list[str] = []
+        for no in sorted({p.unit_no for p in self.plans}):
+            name = next(p.unit_name or p.vehicle.name for p in self.plans if p.unit_no == no)
+            if name not in names:
+                order.append(name)
+            names[name] = names.get(name, 0) + 1
+        return " + ".join(f"{names[n]} × {n}" for n in order)

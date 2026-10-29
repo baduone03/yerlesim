@@ -14,7 +14,7 @@ import numpy as np
 
 from .constraints import EPS, support_ok, unload_rank
 from .models import CargoItem, CargoUnit, FleetPlan, Placement, Rules, UnplacedUnit, VehiclePlan
-from .optimizer import Strategy, _Packer, finalize_plan, fleet_metrics
+from .optimizer import Strategy, _Packer, finalize_plan, fleet_metrics, split_stop_notes
 
 REMOVED_REASON = "Kullanıcı tarafından araçtan çıkarıldı."
 
@@ -40,6 +40,7 @@ def refresh_fleet(fleet: FleetPlan, rules: Rules) -> FleetPlan:
     units = [CargoUnit(p.uid, p.item, 0) for plan in fleet.plans for p in plan.placements]
     units += [CargoUnit(u.uid, u.item, 0) for u in fleet.unplaced]
     manual = fleet.metrics.get("manual_edits", 0)
+    fleet.notes = split_stop_notes(fleet)
     fleet.metrics = fleet_metrics(fleet, units)
     fleet.metrics["manual_edits"] = manual
     return fleet

@@ -35,5 +35,5 @@ def test_roundtrip_and_export():
     assert not errors and back == items
     fleet = plan_fleet(get_default_vehicle("orta_kamyonet"), items, Rules())
     csv_text = fleet_placements_csv(fleet)
-    assert csv_text.splitlines()[0].startswith("arac_no;yukleme_sirasi")
+    assert csv_text.splitlines()[0].startswith("arac_no;arac;kasa;yukleme_sirasi")
     assert len(csv_text.strip().splitlines()) == 4
