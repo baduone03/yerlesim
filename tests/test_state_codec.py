@@ -35,3 +35,13 @@ def test_old_links_with_unknown_or_missing_fields_still_open():
 def test_corrupt_text_raises_value_error():
     with pytest.raises(ValueError):
         decode_state("bozuk-veri")
+
+
+def test_numpy_values_from_table_editor_are_serialized():
+    # Hata: masaüstü tablo düzenleyicisinden gelen np.int64 / np.bool_ değerleri kayıtta çöküyordu.
+    import numpy as np
+
+    it = CargoItem("A", "A", "koli", np.int64(2), np.float64(10), 10, 10, 5, fragile=np.bool_(True),
+                   delivery_stop=np.int64(1))
+    items, _, _, _ = decode_state(encode_state([it], Rules(), default_vehicles()))
+    assert items[0].quantity == 2 and items[0].fragile is True

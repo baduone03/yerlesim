@@ -19,6 +19,14 @@ from .vehicle_data import default_vehicles
 VERSION = 1
 
 
+def _plain(o):
+    """NumPy/pandas sayı ve mantık tiplerini JSON'a uygun Python tiplerine çevirir
+    (tablo düzenleyiciden gelen değerler np.int64 / np.bool_ olabilir)."""
+    if hasattr(o, "item"):
+        return o.item()
+    raise TypeError(f"{type(o).__name__} JSON'a çevrilemez")
+
+
 def _only_fields(cls, d: dict) -> dict:
     """Bilinmeyen alanları atar (eski/yeni sürüm bağlantıları da açılabilsin)."""
     names = {f.name for f in fields(cls)}
@@ -42,7 +50,7 @@ def encode_state(items: list[CargoItem], rules: Rules, vehicles: dict[str, Vehic
     payload = {"v": VERSION, "i": [asdict(i) for i in items], "r": asdict(rules), "vh": changed}
     if availability:
         payload["fa"] = availability
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=_plain).encode("utf-8")
     return base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii").rstrip("=")
 
 

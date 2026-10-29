@@ -109,7 +109,7 @@ def figure_3d(plan: VehiclePlan, rules: Rules, upto_step: Optional[int] = None, 
         else:
             y = 0 if d.kind == "yan_sol" else v.width
             door_txt.append(((d.x_start + d.x_end) / 2, y, v.height + 10, "YAN KAPI"))
-    door_txt.append((0, v.width / 2, v.height + 10, "ÖN (kabin)"))
+    door_txt.append((0, v.width / 2, v.height + 10, "ÖN (kabin)" if not v.body_label or v.trailer is not None else "ÖN"))
     fig.add_trace(go.Scatter3d(x=[t[0] for t in door_txt], y=[t[1] for t in door_txt], z=[t[2] for t in door_txt],
                                mode="text", text=[t[3] for t in door_txt], textfont=dict(size=12, color=FRAME),
                                showlegend=False, hoverinfo="skip"))

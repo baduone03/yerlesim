@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 from pathlib import Path
 
 import pandas as pd
@@ -43,6 +44,7 @@ from loadplanner.vehicle_data import default_vehicles, get_default_vehicle
 from loadplanner.visualization import figure_2d, figure_3d
 
 EXAMPLE_CSV = Path(__file__).parent / "examples" / "ornek_yukler.csv"
+ITEM_DEFAULTS = {f.name: (f.default if f.default is not dataclasses.MISSING else "") for f in dataclasses.fields(CargoItem)}
 
 LIMITATIONS = """
 **Bu sürümün sınırları:**
@@ -399,7 +401,13 @@ def items_tab() -> None:
                 new_items, errs = [], []
                 for n, r in edited.iterrows():
                     try:
-                        rec = {k: (None if (k == "max_top_load" and pd.isna(v)) else v) for k, v in r.to_dict().items()}
+                        rec = {}
+                        for k, v in r.to_dict().items():
+                            if k not in ITEM_DEFAULTS:
+                                continue
+                            if v is None or (not isinstance(v, str) and pd.isna(v)):
+                                v = ITEM_DEFAULTS[k]  # boş hücre: alanın varsayılanı (NaN 'doğru' sayılmasın)
+                            rec[k] = v.item() if hasattr(v, "item") else v
                         for k in ("quantity", "delivery_stop", "loading_priority"):
                             rec[k] = int(rec[k])
                         for k in ("code", "name", "notes", "segregation_group"):
@@ -654,6 +662,7 @@ def view_tab() -> None:
     n = len(plan.placements)
     if n == 0:
         st.info("Bu kasaya yük yerleştirilmedi.")
+        manual_edit_panel(fleet, k)
         return
     c1, c2, c3 = st.columns(3)
     labels = c1.toggle("Etiketleri göster", value=n <= 60)
