@@ -31,6 +31,7 @@ from loadplanner.models import (
     Rules,
     Vehicle,
     Zone,
+    access_text,
     doors_for_body,
 )
 from loadplanner.manual import add_unplaced, move_placement, remove_placement, suggest_position, swap_placements
@@ -133,7 +134,7 @@ def vehicle_tab() -> None:
     for v in vehicles.values():
         dims = " + ".join(f"{b.length:.0f}×{b.width:.0f}×{b.height:.0f}" for b in v.bodies)
         rows.append({
-            "Araç": v.name, "Kasa": BODY_TYPES.get(v.body_type, v.body_type).split(" (")[0],
+            "Araç": v.name, "Erişim": " / ".join(access_text(b) for b in v.bodies),
             "İç ölçü (cm)": dims, "Hacim (m³)": round(v.total_volume_cm3 / 1e6, 1),
             "İstiap (kg)": _num(v.total_payload_kg), "Sefer (TL)": _num(v.trip_cost),
             "Veri": "DEMO" if v.is_demo else "Kullanıcı",
@@ -533,18 +534,19 @@ def optimize_tab() -> None:
     st.caption("Her araç tipinden kaç adet kullanılabileceğini (0 = kullanma) ve biliyorsanız sefer maliyetini girin. "
                "Maliyet 'Minimum maliyet' önceliğinde ve karma filo seçiminde kullanılır.")
     av = availability()
-    df = pd.DataFrame([{"id": k, "Araç": v.name, "Adet": int(av.get(k, 0)), "Sefer maliyeti (TL)": v.trip_cost}
+    df = pd.DataFrame([{"id": k, "Araç": v.name, "Adet": int(av.get(k, 0)), "Maliyet (TL)": v.trip_cost}
                        for k, v in vehicles.items()])
     edited = st.data_editor(
         df, hide_index=True, width="stretch", key="avail_editor",
         column_config={"id": None, "Araç": st.column_config.TextColumn(disabled=True),
                        "Adet": st.column_config.NumberColumn(min_value=0, max_value=50, step=1, required=True),
-                       "Sefer maliyeti (TL)": st.column_config.NumberColumn(min_value=0, step=500, format="%.0f")})
+                       "Maliyet (TL)": st.column_config.NumberColumn(min_value=0, step=500, format="%.0f",
+                                                                     help="Sefer başı maliyet (isteğe bağlı)")})
     for _, row in edited.iterrows():
         k = row["id"]
         n = int(row["Adet"]) if not pd.isna(row["Adet"]) else 0
         av[k] = max(n, 0)
-        c = None if pd.isna(row["Sefer maliyeti (TL)"]) else float(row["Sefer maliyeti (TL)"])
+        c = None if pd.isna(row["Maliyet (TL)"]) else float(row["Maliyet (TL)"])
         if c != vehicles[k].trip_cost:
             vehicles[k] = copy.deepcopy(vehicles[k])
             vehicles[k].trip_cost = c
@@ -565,8 +567,10 @@ def optimize_tab() -> None:
             for e in errs:
                 st.error(e)
             return
-        for w in warns:
-            st.info(w)
+        if warns:
+            with st.expander(f"Girdi uyarıları ({len(warns)})", expanded=len(warns) <= 2):
+                for w in warns:
+                    st.info(w)
         bar = st.progress(0.0, text="Hazırlanıyor...")
         res = compare_vehicles([copy.deepcopy(vehicles[v]) for v in sel], ss["items"], ss["rules"],
                                objective=obj, depth=depth, availability={k: av[k] for k in sel},
@@ -839,6 +843,8 @@ def report_tab() -> None:
                 st.markdown("**Uyarılar**")
                 for x in plan.warnings:
                     st.warning(f"{x.category}: {x.message}")
+            for x in plan.infos:
+                st.caption(f"ℹ️ {x.category}: {x.message}")
             seq = sorted(plan.placements, key=lambda p: p.load_step)
             st.markdown("**Yükleme sırası:** " + " → ".join(p.uid for p in seq[:80]) + (" ..." if len(seq) > 80 else ""))
             useq = sorted(plan.placements, key=lambda p: p.unload_step)

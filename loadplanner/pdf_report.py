@@ -16,7 +16,7 @@ from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 
-from .models import BODY_TYPES, CARGO_TYPES, FleetPlan, Rules, VehiclePlan
+from .models import CARGO_TYPES, FleetPlan, Rules, VehiclePlan, access_text
 from .optimizer import fmt_num
 from .visualization import OTHER, color_map
 
@@ -127,7 +127,7 @@ def _drawing(pdf: _Doc, plan: VehiclePlan, rules: Rules, view: str, colors: dict
     pdf.set_xy(pdf.l_margin, top + h / 2 - 2)
     pdf.cell(7, 4, "ÖN", align="C")
     pdf.set_xy(x0 + w, top + h / 2 - 2)
-    pdf.cell(7, 4, "KAPI", align="L")
+    pdf.cell(7, 4, "KAPI" if any(d.kind == "arka" for d in v.doors) else "ARKA", align="L")
     pdf.set_y(top + h + 3)
     pdf.set_draw_color(0, 0, 0)
 
@@ -141,7 +141,7 @@ def _vehicle_section(pdf: _Doc, plan: VehiclePlan, total: int, rules: Rules, man
     pdf.h1(f"Yükleme Talimatı - Araç {plan.unit_no}/{total}{body}")
     demo = " (DEMO ölçüler)" if v.is_demo else ""
     name = plan.unit_name or v.name
-    pdf.para(f"{name}{demo}  |  {BODY_TYPES.get(v.body_type, '')}  |  İç ölçü: {v.length:.0f} × {v.width:.0f} × "
+    pdf.para(f"{name}{demo}  |  Erişim: {access_text(v)}  |  İç ölçü: {v.length:.0f} × {v.width:.0f} × "
              f"{v.height:.0f} cm  |  İstiap: {fmt_num(v.max_payload_kg)} kg")
     pdf.para(f"Yük: {m['placed_count']} adet, {fmt_num(m['placed_weight_kg'])} kg  |  Hacim kullanımı "
              f"%{100 * m['volume_util']:.0f}  |  Ağırlık kullanımı %{100 * m['weight_util']:.0f}  |  "
@@ -199,6 +199,8 @@ def _vehicle_section(pdf: _Doc, plan: VehiclePlan, total: int, rules: Rules, man
     if plan.warnings:
         pdf.h2("Uyarılar")
         pdf.para("\n".join(f"• {w.category}: {w.message}" for w in plan.warnings))
+    if plan.infos:
+        pdf.para("\n".join(f"Bilgi - {w.category}: {w.message}" for w in plan.infos), size=7)
 
     # Yükleme adımları
     pdf.h2("Adım adım yükleme sırası")

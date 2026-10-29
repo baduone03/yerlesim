@@ -177,3 +177,21 @@ def test_all_demo_profiles_are_valid_and_plan():
         assert f.metrics["unplaced_count"] == 0 or vid == "panelvan", vid
         for p in f.plans:
             assert p.is_valid, (vid, p.errors)
+
+
+def test_item_cannot_be_tucked_under_an_overhang():
+    # Bulanık testte bulunan hata: taşan bir yükün altına kırılabilir yük sokuluyordu.
+    from loadplanner.models import CargoUnit
+    from loadplanner.optimizer import Strategy, _Packer
+
+    v = veh(L=300, W=100, H=200)
+    pk = _Packer(v, Rules(), Strategy("t", "hacim", "uzun"))
+    base = item("BASE", L=100, W=100, H=50, kg=100, max_top_load=500)
+    top = item("TOP", L=120, W=100, H=50, kg=50)
+    frag = item("FRAG", L=50, W=100, H=50, kg=10, fragile=True)
+    pk.place(CargoUnit("BASE#1", base, 0), 1.0, (0, 0, 0, 100, 100, 50), "", [])
+    ok, _, supp = pk._check(top, 1.0, (0, 0, 50, 120, 100, 100))
+    assert ok  # %83 destek, 20 cm taşma
+    pk.place(CargoUnit("TOP#1", top, 0), 1.0, (0, 0, 50, 120, 100, 100), "", supp)
+    ok, why, _ = pk._check(frag, 1.0, (100, 0, 0, 150, 100, 50))
+    assert not ok and why == "ust_temas"

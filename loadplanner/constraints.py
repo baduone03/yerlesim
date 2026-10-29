@@ -242,7 +242,7 @@ def _weight_violations(vehicle: Vehicle, placements: list[Placement]) -> tuple[l
                              f"aracın yük dağılım diyagramına göre kontrol edin.{tip}".replace(",", ".")))
     a = vehicle.axles
     if wa["axle"] is None:
-        out.append(Violation("AKS", "uyari",
+        out.append(Violation("AKS", "bilgi",
                              "Aks konumları girilmediği için aks yükü hesaplanmadı. Güvenlik sonucu verilemez."))
         return out, wa
     f, r = wa["axle"]["front"], wa["axle"]["rear"]
@@ -257,7 +257,7 @@ def _weight_violations(vehicle: Vehicle, placements: list[Placement]) -> tuple[l
         out.append(Violation("AKS", "hata",
                              f"{a.rear_label} faydalı yük payı yaklaşık {r:.0f} kg; girilen sınır {a.rear_payload_limit_kg:.0f} kg."))
     if not limits_known:
-        out.append(Violation("AKS", "uyari",
+        out.append(Violation("AKS", "bilgi",
                              f"Aks yükleri yaklaşık hesaplandı ({a.front_label}: {f:.0f} kg, {a.rear_label}: {r:.0f} kg, yalnız faydalı yük). "
                              "Aks başına izin verilen faydalı yük girilmediği için uygunluk değerlendirilmedi."))
     return out, wa
@@ -409,7 +409,7 @@ def securing_warnings(vehicle: Vehicle, placements: list[Placement], arr: Option
         return out
     arr = _arr(placements) if arr is None else arr
     W = vehicle.width
-    lateral, forward = [], []
+    lateral, forward, upper_open = [], [], []
     for i in range(n):
         b = arr[i]
         xo = overlap_1d(arr[:, 0], arr[:, 3], b[0], b[3])
@@ -419,10 +419,15 @@ def securing_warnings(vehicle: Vehicle, placements: list[Placement], arr: Option
         left = arr[xo & zo & (arr[:, 4] <= b[1] + EPS), 4]
         right = arr[xo & zo & (arr[:, 1] >= b[4] - EPS), 1]
         free_y = (b[1] - (left.max() if left.size else 0.0)) + ((right.min() if right.size else W) - b[4])
-        if free_y > GAP_LIMIT_CM:
-            lateral.append((placements[i].uid, free_y))
         front = arr[yo & zo & (arr[:, 3] <= b[0] + EPS), 3]
         free_x = b[0] - (front.max() if front.size else 0.0)
+        if b[2] > EPS:
+            # Üst kattaki yük: tabanda kaymaz ama önü/yanı açıksa devrilebilir.
+            if free_x > GAP_LIMIT_CM or free_y > GAP_LIMIT_CM:
+                upper_open.append(placements[i].uid)
+            continue
+        if free_y > GAP_LIMIT_CM:
+            lateral.append((placements[i].uid, free_y))
         if free_x > GAP_LIMIT_CM:
             forward.append((placements[i].uid, free_x))
     if lateral:
@@ -437,6 +442,10 @@ def securing_warnings(vehicle: Vehicle, placements: list[Placement], arr: Option
                              f"{len(forward)} yükün önünde (kabin tarafında) {GAP_LIMIT_CM:.0f} cm'den fazla boşluk var "
                              f"(en büyüğü {ex[0]}: {ex[1]:.0f} cm). Frende öne kaymaya karşı takoz/boş palet koyun veya "
                              "spanzetle sabitleyin.", [u for u, _ in forward]))
+    if upper_open:
+        out.append(Violation("SABİTLEME", "uyari",
+                             f"Üst katta {len(upper_open)} yükün önü veya yanı açık (yanındaki istif daha alçak). "
+                             "Frende/virajda devrilmeye karşı istifleri streç film veya spanzetle bağlayın.", upper_open))
     rear_free = vehicle.length - float(arr[:, 3].max())
     if rear_free > 50:
         out.append(Violation("SABİTLEME", "uyari",
@@ -496,8 +505,15 @@ def _access_simulation(vehicle, placements, arr, ranks, supporters, zarr, zblock
                 continue
             # Takılma: kurala aykırı biçimde engellenen, kapıya en yakın yükü
             # zorla çıkar ve ihlal yaz. (Kapısı hiç olmayan yük KAPI ihlaliyle raporlandı.)
+            # Birden fazla kapı varsa, kurala aykırı engeli EN AZ olan kapı esas alınır:
+            # bir kapıdan yalnız aynı sıradaki yükler engelliyorsa ihlal yoktur.
             def bad_of(k: int) -> list[int]:
-                return sorted(m for m in blockers(k) if m >= 0 and is_bad_blocker(ranks[m], ranks[k], rules.mode))
+                def bad(c):
+                    return {m for m in c if is_bad_blocker(ranks[m], ranks[k], rules.mode)}
+                top = bad(on_top[k] & remaining)
+                if not door_info[k]:
+                    return sorted(top)
+                return sorted(top | min((bad(c & remaining) for c in door_info[k]), key=len))
 
             stuck = [k for k in group if bad_of(k)]
             if stuck:
@@ -523,9 +539,11 @@ def _access_simulation(vehicle, placements, arr, ranks, supporters, zarr, zblock
 
     if rules.mode == "FIFO":
         # Yükleme sırası = boşaltma sırası olmalı; önündeki/üstündeki yük farklı öncelikteyse çelişki.
+        # Birden fazla kapı varsa farklı öncelikteki engeli en az olan kapı esas alınır.
         reported = set()
         for i in range(n):
-            for j in on_top[i] | (min(door_info[i], key=len) if door_info[i] else set()):
+            diff = [{j for j in c if abs(ranks[i] - ranks[j]) > EPS} for c in door_info[i]]
+            for j in on_top[i] | (min(diff, key=len) if diff else set()):
                 if abs(ranks[i] - ranks[j]) > EPS and (i, j) not in reported:
                     reported.add((i, j))
                     a, b = placements[i], placements[j]

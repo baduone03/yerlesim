@@ -152,8 +152,9 @@ def figure_2d(plan: VehiclePlan, rules: Rules, view: str, upto_step: Optional[in
     fig.update_xaxes(title=ay[0], range=[-5, lim[0] + 5], showgrid=False, zeroline=False)
     fig.update_yaxes(title=ay[1], range=[-5, lim[1] + 5], showgrid=False, zeroline=False,
                      scaleanchor="x", scaleratio=1)
-    titles = {"ust": "Üstten görünüm (sağda arka kapı)", "yan": "Yandan görünüm (sol taraftan bakış, sağda arka kapı)",
-              "arka": "Arkadan görünüm (arka kapıdan içeri bakış)"}
+    back = "arka kapı" if any(d.kind == "arka" for d in v.doors) else "arka"
+    titles = {"ust": f"Üstten görünüm (sağda {back})", "yan": f"Yandan görünüm (sol taraftan bakış, sağda {back})",
+              "arka": "Arkadan görünüm (arkadan içeri bakış)"}
     fig.update_layout(title=titles[view], height=380, margin=dict(l=10, r=10, t=40, b=10),
                       legend=dict(orientation="h", y=-0.25), plot_bgcolor="#fcfcfb")
     return fig

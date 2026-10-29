@@ -136,6 +136,21 @@ def doors_for_body(body_type: str, length: float) -> list[Door]:
     return [Door("arka")]
 
 
+def access_text(vehicle: "Vehicle") -> str:
+    """Kapıların kısa açıklaması, ör. 'arka kapı + iki yan (tente)'."""
+    kinds = [d.kind for d in vehicle.doors]
+    parts = []
+    if "arka" in kinds:
+        parts.append("arka kapı")
+    sides = [k for k in kinds if k != "arka"]
+    full = all(d.x_start <= 0 and d.x_end >= vehicle.length for d in vehicle.doors if d.kind != "arka")
+    if len(sides) == 2:
+        parts.append("iki yan (tente)" if full else "iki yan kapı")
+    elif sides:
+        parts.append(("sol" if sides[0] == "yan_sol" else "sağ") + " yan kapı")
+    return " + ".join(parts) or "kapı yok"
+
+
 @dataclass
 class Vehicle:
     """Bir yük kasası. ``trailer`` varsa araç kamyon + römork kombinasyonudur;
@@ -352,7 +367,7 @@ class Placement:
 class Violation:
     """Bir kural ihlali veya uyarı.
 
-    severity: "hata" (plan geçersiz) veya "uyari" (kullanıcı değerlendirmeli).
+    severity: "hata" (plan geçersiz), "uyari" (kullanıcı değerlendirmeli) veya "bilgi".
     """
 
     category: str
@@ -396,6 +411,10 @@ class VehiclePlan:
     @property
     def warnings(self) -> list[Violation]:
         return [v for v in self.violations if v.severity == "uyari"]
+
+    @property
+    def infos(self) -> list[Violation]:
+        return [v for v in self.violations if v.severity == "bilgi"]
 
     @property
     def is_valid(self) -> bool:

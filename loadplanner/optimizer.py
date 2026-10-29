@@ -30,6 +30,7 @@ from .constraints import (
     corridor_mask,
     door_usable,
     is_bad_blocker,
+    overlap_1d,
     support_ok,
     unload_rank,
     verify_plan,
@@ -196,6 +197,14 @@ class _Packer:
             return False, "sinir", []
         if boxes_overlap_mask(self.boxes, b).any() or boxes_overlap_mask(self.zones, b).any():
             return False, "cakisma", []
+        if self.boxes.shape[0]:
+            # Yeni yük, mevcut bir yükün taşan kısmının altına sokulamaz: üstteki yük ona
+            # temas eder ve (kırılabilirse ezilir) yük dağılımı değişir.
+            B = self.boxes
+            under_overhang = ((np.abs(B[:, 2] - b[5]) < 1e-4) & overlap_1d(B[:, 0], B[:, 3], b[0], b[3])
+                              & overlap_1d(B[:, 1], B[:, 4], b[1], b[4]))
+            if under_overhang.any():
+                return False, "ust_temas", []
         if not relax_seg:
             if incompat is None:
                 incompat = self._incompat_mask(item)
@@ -631,8 +640,8 @@ def split_stops(fleet: FleetPlan) -> dict[int, list[int]]:
 
 
 def split_stop_notes(fleet: FleetPlan) -> list[str]:
-    return [f"{s}. durağın yükleri {len(u)} araca bölündü (Araç {', '.join(map(str, u))}). "
-            "Teslimatta her araç bu durağa uğramalı." for s, u in split_stops(fleet).items()]
+    return [f"Durak {s}: yükler {len(u)} araca bölündü (Araç {', '.join(map(str, u))}); "
+            "teslimatta her araç bu durağa uğramalı." for s, u in split_stops(fleet).items()]
 
 
 def plan_fleet(vehicle: Vehicle, items: list[CargoItem], rules: Rules, max_vehicles: int = 5,
@@ -828,9 +837,19 @@ def compare_vehicles(vehicles: list[Vehicle], items: list[CargoItem], rules: Rul
     full = default_strategies(depth, rules.mode)
     report = progress or (lambda frac, text: None)
     active = [v for v in vehicles if avail[v.id] > 0]
+    # Eldeki bütün adetlerin toplam ağırlık/hacim kapasitesi bile yetmeyen tipler tek başına
+    # planlanmaz (en az bir tip yetiyorsa); karma filoda yine kullanılabilirler.
+    total_w = sum(i.unit_weight * i.quantity for i in items)
+    total_v = sum(i.unit_volume_cm3 * i.quantity for i in items)
+
+    def could_carry_all(v: Vehicle) -> bool:
+        return (total_w <= v.total_payload_kg * avail[v.id] + EPS
+                and total_v <= v.total_volume_cm3 * avail[v.id] + EPS)
+
+    single = [v for v in active if could_carry_all(v)] or active
     fleets = []
-    for i, v in enumerate(active):
-        report(0.6 * i / max(len(active), 1), f"Ön eleme: {v.name}")
+    for i, v in enumerate(single):
+        report(0.6 * i / max(len(single), 1), f"Ön eleme: {v.name}")
         f = plan_fleet(v, items, rules, avail[v.id], screen, objective)
         f.score = fleet_score(f, objective)
         fleets.append(f)
@@ -839,9 +858,17 @@ def compare_vehicles(vehicles: list[Vehicle], items: list[CargoItem], rules: Rul
     refined = []
     for i, f in enumerate(fleets[:k]):
         report(0.6 + 0.3 * i / max(min(k, len(fleets)), 1), f"Ayrıntılı yerleşim: {f.vehicle.name}")
-        g = _best_fleet(f.vehicle, items, rules, avail[f.vehicle.id], full, objective)
+        g = plan_fleet(f.vehicle, items, rules, avail[f.vehicle.id], full, objective)
         g.score = fleet_score(g, objective)
         refined.append(g)
+    refined.sort(key=lambda f: f.score)
+    if refined and refined[0].metrics["split_stops"] and refined[0].n_vehicles > 1:
+        # Durakları bölmeyen varyant yalnız öndeki seçenek için denenir (hız).
+        lead = refined[0]
+        report(0.88, f"Durak bölünmesi azaltılıyor: {lead.vehicle.name}")
+        g = _best_fleet(lead.vehicle, items, rules, avail[lead.vehicle.id], full, objective)
+        g.score = fleet_score(g, objective)
+        refined[0] = g
     fleets = refined + fleets[k:]
     best = min(fleets, key=lambda f: f.score) if fleets else None
     needs_mixed = best is None or best.n_vehicles > 1 or best.metrics["unplaced_count"] > 0 or objective == "min_maliyet"
