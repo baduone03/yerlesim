@@ -132,6 +132,12 @@ def _drawing(pdf: _Doc, plan: VehiclePlan, rules: Rules, view: str, colors: dict
     pdf.set_draw_color(0, 0, 0)
 
 
+def _short_orientation(label: str) -> str:
+    """Tablo için kısa yönelim etiketi: 'E-B-Y (90° döndürülmüş)' -> 'E-B-Y 90°'."""
+    return (label.replace(" (standart)", "").replace(" (90° döndürülmüş)", " 90°")
+            .replace(" (yan yatırılmış)", " yan").replace(" (dikey çevrilmiş)", " dikey"))
+
+
 def _vehicle_section(pdf: _Doc, plan: VehiclePlan, total: int, rules: Rules, manual_edits: int = 0) -> None:
     v = plan.vehicle
     m = plan.metrics
@@ -216,7 +222,7 @@ def _vehicle_section(pdf: _Doc, plan: VehiclePlan, total: int, rules: Rules, man
         for p in sorted(plan.placements, key=lambda q: q.load_step):
             name = p.item.name if len(p.item.name) <= 30 else p.item.name[:29] + "…"
             table.row([str(p.load_step), p.uid, name, str(p.item.delivery_stop), f"{p.x:.0f}", f"{p.y:.0f}", f"{p.z:.0f}",
-                       f"{p.dx:.0f}×{p.dy:.0f}×{p.dz:.0f}", p.orientation, f"{p.weight:.0f}"])
+                       f"{p.dx:.0f}×{p.dy:.0f}×{p.dz:.0f}", _short_orientation(p.orientation), f"{p.weight:.0f}"])
     pdf.set_draw_color(0, 0, 0)
 
     # Boşaltma
