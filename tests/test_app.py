@@ -61,3 +61,28 @@ def test_manual_edit_and_pdf_flow():
     next(x for x in at.button if "PDF'ini hazırla" in x.label).click().run()
     assert not at.exception
     assert at.session_state["pdf_cache"][1][:5] == b"%PDF-"
+
+
+def test_lcl_mode_flow_with_vgm_and_breakdown():
+    from loadplanner.models import CargoItem
+
+    at = AppTest.from_file(APP, default_timeout=180).run()
+    at.session_state["items"] = [
+        CargoItem("A1", "Tekstil", "koli", 30, 60, 40, 40, 18, max_top_load=80, shipper="Aslan Tekstil"),
+        CargoItem("B1", "Makine parçası", "sandik", 3, 120, 100, 100, 600, max_top_load=600, shipper="Bora Makine"),
+    ]
+    at.run()
+    mode_radio = next(r for r in at.radio if r.label == "Taşıma şekli")
+    mode_radio.set_value("lcl").run()
+    assert at.session_state["transport_mode"] == "lcl"
+    assert at.session_state["rules"].keep_shipper_together
+    rate = next(n for n in at.number_input if n.label == "W/M birim fiyatı")
+    rate.set_value(45.0).run()
+    next(b for b in at.button if "Yerleşimi hesapla" in b.label).click().run()
+    assert not at.exception
+    best = at.session_state["results"][0]
+    assert all(p.vehicle.is_container for p in best.plans) and best.metrics["unplaced_count"] == 0
+    md = " ".join(m.value for m in at.markdown)
+    assert "LCL gönderici dökümü" in md and "VGM ön hesabı" in md
+    next(x for x in at.button if "PDF'ini hazırla" in x.label).click().run()
+    assert not at.exception and at.session_state["pdf_cache"][1][:5] == b"%PDF-"

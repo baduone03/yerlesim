@@ -241,6 +241,8 @@ def _weight_violations(vehicle: Vehicle, placements: list[Placement]) -> tuple[l
                              f"Kısmi ağır yükte {'ön aks / şasi pimi' if off < 0 else 'arka aks'} aşırı yüklenebilir; "
                              f"aracın yük dağılım diyagramına göre kontrol edin.{tip}".replace(",", ".")))
     a = vehicle.axles
+    if wa["axle"] is None and vehicle.is_container:
+        return out, wa  # konteynerde aks hesabı yok; VGM özeti ayrıca gösterilir
     if wa["axle"] is None:
         out.append(Violation("AKS", "bilgi",
                              "Aks konumları girilmediği için aks yükü hesaplanmadı. Güvenlik sonucu verilemez."))
@@ -333,6 +335,10 @@ def verify_plan(vehicle: Vehicle, placements: list[Placement], rules: Rules,
                 v.append(Violation("İSTİF", "hata", f"{_label(s)} {why2}, ancak üzerinde {_label(p)} var.", [s.uid, p.uid]))
             if not p.item.stackable:
                 v.append(Violation("İSTİF", "hata", f"{_label(p)} istiflenemez (başka yükün üstüne konulamaz) ama {_label(s)} üzerinde.", [p.uid, s.uid]))
+            if rules.keep_shipper_together and p.item.shipper_key != s.item.shipper_key:
+                v.append(Violation("GÖNDERİCİ", "hata",
+                                   f"{_label(p)} ({p.item.shipper or 'gönderici yok'}) başka bir göndericinin yükü "
+                                   f"{_label(s)} ({s.item.shipper or 'gönderici yok'}) üzerine konulmuş.", [p.uid, s.uid]))
             if not rules.allow_mixed_stop_stacking and abs(ranks[i] - ranks[j]) > EPS:
                 v.append(Violation("İSTİF", "hata",
                                    f"{_label(p)} farklı boşaltma sırasındaki {_label(s)} üzerine konulmuş (karışık istif kapalı).",

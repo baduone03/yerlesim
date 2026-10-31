@@ -27,6 +27,12 @@ DOOR_KINDS = {
     "yan_sag": "Sağ yan kapı",
 }
 
+TRANSPORT_MODES = {
+    "karayolu": "Karayolu araçları",
+    "fcl": "Konteyner - FCL (komple)",
+    "lcl": "Konteyner - LCL (parsiyel / konsolidasyon)",
+}
+
 RULE_MODES = {
     "teslimat": "Teslimat sırasına göre (önerilen)",
     "LIFO": "LIFO - son yüklenen ilk çıkar",
@@ -173,6 +179,9 @@ class Vehicle:
     trailer: Optional["Vehicle"] = None
     trip_cost: Optional[float] = None  # sefer başı maliyet (TL); bilinmiyorsa None
     body_label: str = ""  # kombinasyonda kasanın adı, ör. "Kamyon kasası", "Römork"
+    is_container: bool = False  # deniz konteyneri (FCL/LCL)
+    tare_kg: Optional[float] = None  # konteyner darası (VGM için)
+    max_gross_kg: Optional[float] = None  # konteyner azami brüt ağırlığı (CSC plakası)
 
     @property
     def volume_cm3(self) -> float:
@@ -233,6 +242,11 @@ class CargoItem:
     notes: str = ""
     segregation_group: str = ""  # ör. "gıda", "kimyasal"; Rules.incompatible ile birlikte kullanılır
     cold_chain: bool = False  # soğuk zincir: yalnız frigorifik araca yüklenir
+    shipper: str = ""  # gönderici (LCL: konteyneri paylaşan müşteri)
+
+    @property
+    def shipper_key(self) -> str:
+        return normalize_group(self.shipper)
 
     @property
     def top_load_limit(self) -> float:
@@ -295,6 +309,8 @@ class Rules:
     # Kısmi yükte yükü kabinden kapıya doğru kaydırarak ağırlık merkezini kasa
     # ortasına yaklaştır (önde kalan boşluk takozlanmalıdır).
     center_partial_load: bool = False
+    # LCL: farklı göndericilerin yükleri üst üste konmaz, aynı göndericininkiler arka arkaya yüklenir.
+    keep_shipper_together: bool = False
     # Birlikte istiflenemeyen ve arasında en az ``separation_cm`` yatay mesafe
     # bırakılması gereken ayrım grubu çiftleri, ör. (("gıda", "kimyasal"),).
     incompatible: tuple = ()

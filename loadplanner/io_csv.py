@@ -35,6 +35,7 @@ COLUMNS = {
     "notlar": ("notes", str),
     "ayrim_grubu": ("segregation_group", str),
     "soguk_zincir": ("cold_chain", bool),
+    "gonderici": ("shipper", str),
 }
 REQUIRED = ["kod", "adet", "boy_cm", "en_cm", "yukseklik_cm", "birim_agirlik_kg"]
 
@@ -164,6 +165,7 @@ def placements_dataframe(plan: VehiclePlan, with_vehicle: bool = False) -> pd.Da
             "ad": p.item.name,
             "tip": CARGO_TYPES.get(p.item.cargo_type, p.item.cargo_type),
             "teslimat_sirasi": p.item.delivery_stop,
+            "gonderici": p.item.shipper,
             "x_cm": round(p.x, 1),
             "y_cm": round(p.y, 1),
             "z_cm": round(p.z, 1),

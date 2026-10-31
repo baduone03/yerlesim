@@ -26,6 +26,7 @@ from loadplanner.models import (
     PALLET_PRESETS,
     OBJECTIVES,
     RULE_MODES,
+    TRANSPORT_MODES,
     AxleConfig,
     CargoItem,
     Door,
@@ -38,12 +39,14 @@ from loadplanner.models import (
 from loadplanner.manual import add_unplaced, move_placement, remove_placement, suggest_position, swap_placements
 from loadplanner.optimizer import compare_vehicles, fmt_num
 from loadplanner.pdf_report import build_loading_pdf
-from loadplanner.state_codec import decode_state, encode_state
+from loadplanner.container import lcl_breakdown, vgm_summary
+from loadplanner.state_codec import decode_extra, decode_state, encode_state
 from loadplanner.validation import validate_items, validate_vehicle
 from loadplanner.vehicle_data import default_vehicles, get_default_vehicle
 from loadplanner.visualization import figure_2d, figure_3d
 
 EXAMPLE_CSV = Path(__file__).parent / "examples" / "ornek_yukler.csv"
+LCL_DEFAULTS = {"rate": None, "currency": "USD", "min_wm": 1.0}
 ITEM_DEFAULTS = {f.name: (f.default if f.default is not dataclasses.MISSING else "") for f in dataclasses.fields(CargoItem)}
 
 LIMITATIONS = """
@@ -85,6 +88,11 @@ def init_state() -> None:
             ss["items"], ss["rules"], ss["vehicles"], avail = decode_state(st.query_params["d"])
             if avail:
                 ss["avail"] = avail
+            extra = decode_extra(st.query_params["d"])
+            if extra.get("tm") in TRANSPORT_MODES:
+                ss["transport_mode"] = extra["tm"]
+            if isinstance(extra.get("lcl"), dict):
+                ss["lcl"] = {**LCL_DEFAULTS, **extra["lcl"]}
             ss["saved_state"] = st.query_params["d"]
         except ValueError as e:
             ss.setdefault("flash", []).append(("warning", f"{e}. Boş liste ile başlanıyor."))
@@ -95,11 +103,14 @@ def init_state() -> None:
     ss.setdefault("result_sig", None)
     ss.setdefault("objective", "min_arac")
     ss.setdefault("flash", [])
+    ss.setdefault("transport_mode", "karayolu")
+    ss.setdefault("lcl", dict(LCL_DEFAULTS))
 
 
 def signature() -> str:
     ss = st.session_state
-    return repr((ss["items"], ss["vehicles"], ss["rules"], sorted(availability().items()), ss.get("allow_mixed", True)))
+    return repr((ss["items"], ss["vehicles"], ss["rules"], sorted(availability().items()), ss.get("allow_mixed", True),
+                 ss.get("transport_mode", "karayolu")))
 
 
 def flash(msg: str, kind: str = "success") -> None:
@@ -132,18 +143,24 @@ def vehicle_tab() -> None:
         "Gerçek planlama için aracınızın iç ölçülerini, ruhsattaki **istiap haddini** ve biliyorsanız "
         "aks bilgilerini girin."
     )
+    show_containers = st.radio("Göster", ["Karayolu araçları", "Konteynerler"], horizontal=True,
+                               index=1 if st.session_state["transport_mode"] != "karayolu" else 0,
+                               key="vehicle_filter") == "Konteynerler"
+    shown = {k: v for k, v in vehicles.items() if v.is_container == show_containers}
     rows = []
-    for v in vehicles.values():
+    for v in shown.values():
         dims = " + ".join(f"{b.length:.0f}×{b.width:.0f}×{b.height:.0f}" for b in v.bodies)
         rows.append({
             "Araç": v.name, "Erişim": " / ".join(access_text(b) for b in v.bodies),
             "İç ölçü (cm)": dims, "Hacim (m³)": round(v.total_volume_cm3 / 1e6, 1),
-            "İstiap (kg)": _num(v.total_payload_kg), "Sefer (TL)": _num(v.trip_cost),
+            "İstiap (kg)": _num(v.total_payload_kg),
+            **({"Dara (kg)": _num(v.tare_kg), "Azami brüt (kg)": _num(v.max_gross_kg)} if show_containers else {}),
+            ("Navlun" if show_containers else "Sefer (TL)"): _num(v.trip_cost),
             "Veri": "DEMO" if v.is_demo else "Kullanıcı",
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
-    vid = st.selectbox("Düzenlenecek profil", list(vehicles), format_func=lambda k: vehicles[k].name)
+    vid = st.selectbox("Düzenlenecek profil", list(shown), format_func=lambda k: vehicles[k].name)
     v = vehicles[vid]
     if v.notes:
         st.caption(v.notes)
@@ -161,9 +178,18 @@ def vehicle_tab() -> None:
         width = c2.number_input("İç genişlik (cm)", min_value=0.0, value=float(v.width), step=5.0)
         c1, c2 = st.columns(2)
         height = c1.number_input("İç yükseklik (cm)", min_value=0.0, value=float(v.height), step=5.0)
-        payload = c2.number_input("İstiap haddi / azami faydalı yük (kg)", min_value=0.0,
-                                  value=float(v.max_payload_kg), step=50.0)
-        cost = st.number_input("Sefer maliyeti (TL, isteğe bağlı)", min_value=0.0, step=500.0,
+        if v.is_container:
+            tare = c2.number_input("Dara (kg) - CSC plakası", min_value=0.0, value=float(v.tare_kg or 0), step=10.0)
+            gross = st.number_input("Azami brüt ağırlık (kg) - CSC plakası", min_value=0.0,
+                                    value=float(v.max_gross_kg or 0), step=100.0,
+                                    help="Taşınabilecek yük = azami brüt - dara. VGM ön hesabında kullanılır.")
+            payload = max(gross - tare, 0.0)
+            st.caption(f"Taşınabilecek yük: {fmt_num(payload)} kg")
+        else:
+            payload = c2.number_input("İstiap haddi / azami faydalı yük (kg)", min_value=0.0,
+                                      value=float(v.max_payload_kg), step=50.0)
+        cost = st.number_input("Navlun (konteyner başı, isteğe bağlı)" if v.is_container else
+                               "Sefer maliyeti (TL, isteğe bağlı)", min_value=0.0, step=500.0,
                                value=None if v.trip_cost is None else float(v.trip_cost),
                                help="Girilirse 'Minimum maliyet' hedefi ve karma filo seçiminde kullanılır.")
 
@@ -256,7 +282,10 @@ def vehicle_tab() -> None:
             trailer.body_type, trailer.doors = t_body, doors_for_body(t_body, t_len)
         nv = Vehicle(id=vid, name=name, category=v.category, length=length, width=width, height=height,
                      max_payload_kg=payload, doors=doors, zones=zones, axles=axles, is_demo=is_demo, notes=v.notes,
-                     body_type=body, trailer=trailer, trip_cost=cost, body_label=v.body_label)
+                     body_type=body, trailer=trailer, trip_cost=cost, body_label=v.body_label,
+                     is_container=v.is_container,
+                     tare_kg=tare if v.is_container else v.tare_kg,
+                     max_gross_kg=gross if v.is_container else v.max_gross_kg)
         errs = zerr + validate_vehicle(nv)
         if errs:
             for e in errs:
@@ -301,6 +330,10 @@ def item_fields(prefix: str, it: CargoItem) -> dict:
     d["unit_weight"] = c1.number_input("Birim ağırlık (kg)", min_value=0.0, value=float(it.unit_weight), step=1.0, key=f"{prefix}_kg")
     d["delivery_stop"] = c2.number_input("Teslimat sırası (1 = ilk durak)", min_value=1, step=1,
                                          value=int(it.delivery_stop), key=f"{prefix}_stop")
+    lcl_mode = st.session_state.get("transport_mode") == "lcl"
+    if lcl_mode:
+        d["shipper"] = st.text_input("Gönderici (LCL)", it.shipper, key=f"{prefix}_shp",
+                                     help="Konteyneri paylaşan müşteri. Ücret dökümü göndericiye göre yapılır.")
     c1, c2, c3 = st.columns(3)
     d["allow_on_top"] = c1.checkbox("Üstüne yük konabilir", it.allow_on_top, key=f"{prefix}_aot")
     d["fragile"] = c2.checkbox("Kırılabilir / hassas", it.fragile, key=f"{prefix}_frg")
@@ -324,6 +357,8 @@ def item_fields(prefix: str, it: CargoItem) -> dict:
             "Ayrım grubu (ör. gıda, kimyasal)", it.segregation_group, key=f"{prefix}_seg",
             help="Hangi grupların birlikte taşınamayacağı 'Kurallar' sekmesinde tanımlanır.")
         d["notes"] = st.text_input("Sabitleme / taşıma notları", it.notes, key=f"{prefix}_notes")
+        if not lcl_mode:
+            d["shipper"] = st.text_input("Gönderici (konteyner LCL için)", it.shipper, key=f"{prefix}_shp")
     d["code"] = d["code"].strip()
     d["name"] = d["name"].strip() or d["code"]
     return d
@@ -373,7 +408,8 @@ def items_tab() -> None:
         st.rerun()
 
     for idx, it in enumerate(items):
-        flags = "".join([" ❄️" if it.cold_chain else "", " ⚠️kırılır" if it.fragile else ""])
+        flags = "".join([" ❄️" if it.cold_chain else "", " ⚠️kırılır" if it.fragile else "",
+                         f" · {it.shipper}" if it.shipper else ""])
         with st.expander(f"{it.code} - {it.name} × {it.quantity}  |  {it.length:.0f}×{it.width:.0f}×{it.height:.0f} cm, "
                          f"{it.unit_weight:.0f} kg, durak {it.delivery_stop}{flags}"):
             with st.form(f"edit_{idx}_{it.code}"):
@@ -462,6 +498,8 @@ def rules_tab() -> None:
             "- **Teslimat sırası:** yükler *teslimat sırası* alanına göre boşaltılır (1. durak ilk); 1. durağın yükü "
             "kapıya en yakın konur. Yükleme sırası bundan geriye doğru hesaplanır.\n"
             "- **LIFO:** *yükleme önceliği* büyük olan (son yüklenen) ilk çıkar. Arka kapılı araçların doğal düzenidir.\n"
+            "- **Gönderici bir arada (LCL):** 'Gelişmiş kurallar' altında; farklı göndericilerin yükleri üst üste "
+            "konmaz, aynı göndericininkiler arka arkaya yüklenir.\n"
             "- **FIFO:** ilk yüklenen ilk çıkar. Tek arka kapılı araçta ancak farklı öncelikteki yükler birbirinin "
             "önüne geçmezse (yan yana şeritler) mümkündür; tenteli araçta yandan erişim işi kolaylaştırır.\n\n"
             "Her durumda gerçek erişim kontrol edilir: bir yükü çıkarmak için önce başka bir yükü indirmek "
@@ -473,6 +511,9 @@ def rules_tab() -> None:
         center = st.checkbox("Kısmi yükü kasa ortasına doğru kaydır (aks dengesi)", r.center_partial_load,
                              help="Yük kasayı doldurmuyorsa bütün yük kapıya doğru kaydırılarak ağırlık merkezi "
                                   "kasa ortasına yaklaştırılır. Önde kalan boşluk takoz/boş paletle doldurulmalıdır.")
+        shipper_rule = st.checkbox("Aynı göndericinin yükleri bir arada (LCL)", r.keep_shipper_together,
+                                   help="Farklı göndericilerin yükleri üst üste konmaz; her göndericinin yükleri "
+                                        "arka arkaya yüklenerek blok oluşturur.")
         sup = st.slider("Üstteki yük için asgari taban desteği (%)", 50, 100, int(r.min_support_ratio * 100), 5)
         clear = st.number_input("Arka kapı önünde boş bırakılacak mesafe (cm)", min_value=0.0,
                                 value=float(r.rear_clearance_cm), step=10.0)
@@ -502,7 +543,8 @@ def rules_tab() -> None:
     for line in bad_lines:
         st.error(f"Anlaşılamayan satır: '{line}'. Biçim: grup1, grup2")
     new = Rules(mode=mode, allow_mixed_stop_stacking=mixed, min_support_ratio=sup / 100, rear_clearance_cm=clear,
-                incompatible=tuple(pairs), separation_cm=sep, center_partial_load=center)
+                incompatible=tuple(pairs), separation_cm=sep, center_partial_load=center,
+                keep_shipper_together=shipper_rule)
     if new != r:
         st.session_state["rules"] = new
         st.rerun()
@@ -534,43 +576,74 @@ def optimize_tab() -> None:
     ss = st.session_state
     vehicles: dict[str, Vehicle] = ss["vehicles"]
     st.subheader("Araç seçimi ve hesaplama")
+    modes = list(TRANSPORT_MODES)
+    tm = st.radio("Taşıma şekli", modes, format_func=TRANSPORT_MODES.get, horizontal=True,
+                  index=modes.index(ss["transport_mode"]))
+    if tm != ss["transport_mode"]:
+        ss["transport_mode"] = tm
+        if tm == "lcl" and not ss["rules"].keep_shipper_together:
+            ss["rules"] = dataclasses.replace(ss["rules"], keep_shipper_together=True)
+            flash("LCL için 'Aynı göndericinin yükleri bir arada' kuralı açıldı (Kurallar > Gelişmiş).", "info")
+        st.rerun()
+    containers = tm != "karayolu"
+    if tm == "fcl":
+        st.caption("FCL: yükleriniz için en uygun konteyner tipi ve adedi seçilir; konteyner başı navlun "
+                   "girilirse maliyete göre karşılaştırılır. Her konteyner için VGM ön hesabı gösterilir.")
+    elif tm == "lcl":
+        st.caption("LCL: farklı göndericilerin yükleri ortak konteynerde toplanır. Yüklere 'Gönderici' girin; "
+                   "ücret dökümü W/M esasına göre (max(m³, ton)) göndericiye göre yapılır.")
+        lcl = ss["lcl"]
+        c1, c2, c3 = st.columns(3)
+        rate = c1.number_input("W/M birim fiyatı", min_value=0.0, step=1.0, value=lcl["rate"],
+                               help="1 W/M (1 m³ veya 1 ton, hangisi büyükse) için ücret.")
+        cur = c2.text_input("Para birimi", lcl["currency"])
+        min_wm = c3.number_input("Asgari W/M", min_value=0.0, step=0.5, value=float(lcl["min_wm"]))
+        ss["lcl"] = {"rate": rate, "currency": cur.strip() or "USD", "min_wm": min_wm}
+        missing = [i.code for i in ss["items"] if not i.shipper.strip()]
+        if missing:
+            st.warning(f"{len(missing)} yük satırında gönderici girilmemiş ({', '.join(missing[:5])}"
+                       f"{' ...' if len(missing) > 5 else ''}). Bunlar dökümde ayrı satırda görünür.")
     obj = st.radio("Öncelik", list(OBJECTIVES), format_func=OBJECTIVES.get,
                    index=list(OBJECTIVES).index(ss["objective"]), horizontal=True)
     ss["objective"] = obj
 
-    st.markdown("**Kullanılabilir araçlar**")
-    st.caption("Her araç tipinden kaç adet kullanılabileceğini (0 = kullanma) ve biliyorsanız sefer maliyetini girin. "
-               "Maliyet 'Minimum maliyet' önceliğinde ve karma filo seçiminde kullanılır.")
+    st.markdown("**Kullanılabilir konteynerler**" if containers else "**Kullanılabilir araçlar**")
+    st.caption("Her tipten kaç adet kullanılabileceğini (0 = kullanma) ve biliyorsanız "
+               + ("konteyner başı navlunu" if containers else "sefer maliyetini")
+               + " girin. Maliyet 'Minimum maliyet' önceliğinde ve karma seçimde kullanılır.")
     av = availability()
-    df = pd.DataFrame([{"id": k, "Araç": v.name, "Adet": int(av.get(k, 0)), "Maliyet (TL)": v.trip_cost}
-                       for k, v in vehicles.items()])
+    mode_ids = [k for k, v in vehicles.items() if v.is_container == containers]
+    cost_col = "Navlun / konteyner" if containers else "Maliyet (TL)"
+    df = pd.DataFrame([{"id": k, "Araç": vehicles[k].name, "Adet": int(av.get(k, 0)), cost_col: vehicles[k].trip_cost}
+                       for k in mode_ids])
     edited = st.data_editor(
-        df, hide_index=True, width="stretch", key="avail_editor",
+        df, hide_index=True, width="stretch", key=f"avail_editor_{tm}",
         column_config={"id": None, "Araç": st.column_config.TextColumn(disabled=True),
                        "Adet": st.column_config.NumberColumn(min_value=0, max_value=50, step=1, required=True),
-                       "Maliyet (TL)": st.column_config.NumberColumn(min_value=0, step=500, format="%.0f",
-                                                                     help="Sefer başı maliyet (isteğe bağlı)")})
+                       cost_col: st.column_config.NumberColumn(min_value=0, step=100, format="%.0f",
+                                                               help="Sefer / konteyner başı maliyet (isteğe bağlı)")})
     for _, row in edited.iterrows():
         k = row["id"]
         n = int(row["Adet"]) if not pd.isna(row["Adet"]) else 0
         av[k] = max(n, 0)
-        c = None if pd.isna(row["Maliyet (TL)"]) else float(row["Maliyet (TL)"])
+        c = None if pd.isna(row[cost_col]) else float(row[cost_col])
         if c != vehicles[k].trip_cost:
             vehicles[k] = copy.deepcopy(vehicles[k])
             vehicles[k].trip_cost = c
-    allow_mixed = st.checkbox("Farklı araç tiplerini birlikte kullanabilir (karma filo)", value=ss.get("allow_mixed", True))
+    allow_mixed = st.checkbox("Farklı konteyner tiplerini birlikte kullanabilir" if containers else
+                              "Farklı araç tiplerini birlikte kullanabilir (karma filo)", value=ss.get("allow_mixed", True))
     ss["allow_mixed"] = allow_mixed
     with st.expander("Gelişmiş"):
         depth = st.selectbox("Arama derinliği", ["hizli", "normal", "kapsamli"], index=1,
                              format_func={"hizli": "Hızlı", "normal": "Normal (önerilen)", "kapsamli": "Kapsamlı (yavaş)"}.get)
-    sel = [k for k in vehicles if av.get(k, 0) > 0]
+    sel = [k for k in mode_ids if av.get(k, 0) > 0]
 
     if st.button("🚚 Yerleşimi hesapla", type="primary", width="stretch"):
         errs, warns = validate_items(ss["items"])
         for v in sel:
             errs += validate_vehicle(vehicles[v])
         if not sel:
-            errs.append("En az bir araç tipine 0'dan büyük adet girin.")
+            errs.append("En az bir " + ("konteyner" if containers else "araç") + " tipine 0'dan büyük adet girin.")
         if errs:
             for e in errs:
                 st.error(e)
@@ -607,10 +680,13 @@ def optimize_tab() -> None:
     c[0].metric("Araç", m["n_vehicles"])
     c[1].metric("Yerleşen yük", f"{m['placed_count']}/{m['total_units']}")
     c[2].metric("Yükleme metresi", f"{fmt_num(m['ldm'], 1)} LDM")
-    c[3].metric("Sefer maliyeti", f"{fmt_num(m['total_cost'])} TL" if m["total_cost"] is not None else "-")
+    is_cont = any(p.vehicle.is_container for p in best.plans)
+    c[3].metric("Navlun toplamı" if is_cont else "Sefer maliyeti",
+                (fmt_num(m["total_cost"]) + ("" if is_cont else " TL")) if m["total_cost"] is not None else "-")
     st.write(best.explanation)
     for note in best.notes:
         st.warning(note)
+    container_summaries(best)
     rows = []
     for i, f in enumerate(res):
         fm = f.metrics
@@ -628,6 +704,34 @@ def optimize_tab() -> None:
     ss["view_idx"] = st.selectbox("İncelenecek seçenek (3D, rapor ve dışa aktarma için)", range(len(res)),
                                   index=min(ss.get("view_idx", 0), len(res) - 1),
                                   format_func=lambda i: f"{i + 1}. {res[i].label}")
+
+
+def container_summaries(fleet) -> None:
+    """Konteyner seçeneklerinde VGM; LCL modunda gönderici ücret dökümü."""
+    ss = st.session_state
+    vgm = vgm_summary(fleet)
+    if vgm:
+        st.markdown("**VGM ön hesabı (brüt ağırlık)**")
+        st.dataframe(pd.DataFrame([{
+            "Konteyner": f"{r.unit_no}. {r.container}", "Dara (kg)": fmt_num(r.tare_kg), "Yük (kg)": fmt_num(r.cargo_kg),
+            "Brüt / VGM (kg)": fmt_num(r.gross_kg), "Azami brüt (kg)": fmt_num(r.max_gross_kg) if r.max_gross_kg else "-",
+            "Durum": "uygun" if r.ok else "AŞIYOR"} for r in vgm]), hide_index=True, width="stretch")
+        st.caption("Ön hesaptır: istif/sabitleme malzemesi dahil değildir. Resmi VGM, SOLAS'a göre tartımla veya "
+                   "bütün paket, palet ve sabitleme malzemesi ağırlıkları toplanarak (Yöntem 2) beyan edilir.")
+    if ss.get("transport_mode") == "lcl":
+        lcl = ss["lcl"]
+        rows = lcl_breakdown(ss["items"], fleet, lcl["rate"], lcl["min_wm"])
+        cur = lcl["currency"]
+        st.markdown("**LCL gönderici dökümü (W/M)**")
+        st.dataframe(pd.DataFrame([{
+            "Gönderici": r.shipper, "Adet": r.units, "Ağırlık (kg)": fmt_num(r.weight_kg), "Hacim (m³)": fmt_num(r.cbm, 2),
+            "W/M": fmt_num(r.wm, 2), f"Ücret ({cur})": fmt_num(r.charge, 2) if r.charge is not None else "-",
+            "Konteyner": r.containers + (f" ({r.unplaced} yerleşmedi)" if r.unplaced else "")} for r in rows]),
+            hide_index=True, width="stretch")
+        total = sum(r.charge for r in rows if r.charge is not None)
+        st.caption(f"W/M = max(hacim m³, ağırlık ton), en az {fmt_num(lcl['min_wm'], 1)}. "
+                   + (f"Toplam: {fmt_num(total, 2)} {cur}." if lcl["rate"] is not None else
+                      "Ücret için W/M birim fiyatını girin."))
 
 
 def current_fleet():
@@ -823,6 +927,7 @@ def report_tab() -> None:
                 st.warning(conf.message)
     for note in fleet.notes:
         st.warning(note)
+    container_summaries(fleet)
 
     for i, plan in enumerate(fleet.plans):
         pm = plan.metrics
@@ -898,7 +1003,7 @@ def export_tab() -> None:
         st.warning("Bu planda kural ihlali var; PDF'in ilk sayfasında kırmızı uyarı olarak yazılır.")
     # PDF her yeniden çalıştırmada değil, istenince üretilir; plan değişirse önbellek geçersiz olur.
     key = (ss["result_sig"], ss.get("view_idx", 0), fleet.metrics.get("manual_edits", 0),
-           repr(ss["rules"]), fleet.metrics.get("error_count", 0), id(fleet))
+           repr(ss["rules"]), fleet.metrics.get("error_count", 0), id(fleet), repr(ss["lcl"]), ss["transport_mode"])
     cached = ss.get("pdf_cache")
     if cached and cached[0] == key:
         st.download_button("📄 Yükleme talimatını indir (PDF)", cached[1], "yukleme_talimati.pdf", "application/pdf",
@@ -906,7 +1011,10 @@ def export_tab() -> None:
     elif st.button("📄 Yükleme talimatı PDF'ini hazırla", type="primary"):
         try:
             with st.spinner("PDF hazırlanıyor..."):
-                ss["pdf_cache"] = (key, build_loading_pdf(fleet, ss["rules"]))
+                lcl = None
+                if ss["transport_mode"] == "lcl":
+                    lcl = {"items": ss["items"], **ss["lcl"]}
+                ss["pdf_cache"] = (key, build_loading_pdf(fleet, ss["rules"], lcl=lcl))
         except Exception as e:  # PDF üretimi uygulamanın geri kalanını durdurmamalı
             st.error(f"PDF oluşturulamadı: {e}")
         else:
@@ -914,6 +1022,22 @@ def export_tab() -> None:
     st.markdown("**Veri dosyaları**")
     st.download_button("Yerleşim planı ve yük koordinatları (CSV)", fleet_placements_csv(fleet).encode("utf-8-sig"),
                        "yerlesim_plani.csv", "text/csv")
+    if ss["transport_mode"] == "lcl":
+        lcl = ss["lcl"]
+        rows = lcl_breakdown(ss["items"], fleet, lcl["rate"], lcl["min_wm"])
+        ldf = pd.DataFrame([{"gonderici": r.shipper, "adet": r.units, "agirlik_kg": round(r.weight_kg, 1),
+                             "hacim_m3": round(r.cbm, 3), "wm": round(r.wm, 3),
+                             f"ucret_{lcl['currency']}": r.charge, "konteyner": r.containers,
+                             "yerlesmeyen": r.unplaced} for r in rows])
+        st.download_button("LCL gönderici dökümü (CSV)", ldf.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                           "lcl_dokum.csv", "text/csv")
+    vgm = vgm_summary(fleet)
+    if vgm:
+        vdf = pd.DataFrame([{"konteyner_no": r.unit_no, "konteyner": r.container, "dara_kg": r.tare_kg,
+                             "yuk_kg": round(r.cargo_kg, 1), "brut_vgm_kg": round(r.gross_kg, 1),
+                             "azami_brut_kg": r.max_gross_kg} for r in vgm])
+        st.download_button("VGM ön hesabı (CSV)", vdf.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                           "vgm_on_hesap.csv", "text/csv")
     if fleet.unplaced:
         st.download_button("Yerleştirilemeyen yükler (CSV)", unplaced_csv(fleet).encode("utf-8-sig"),
                            "yerlesmeyen_yukler.csv", "text/csv")
@@ -954,7 +1078,12 @@ def save_state_to_url() -> None:
     av = availability()
     defaults = {k: (0 if k == "ozel" else DEFAULT_AVAILABLE) for k in ss["vehicles"]}
     changed_av = {k: n for k, n in av.items() if defaults.get(k) != n}
-    enc = encode_state(ss["items"], ss["rules"], ss["vehicles"], changed_av)
+    extra = {}
+    if ss["transport_mode"] != "karayolu":
+        extra["tm"] = ss["transport_mode"]
+    if ss["lcl"] != LCL_DEFAULTS:
+        extra["lcl"] = ss["lcl"]
+    enc = encode_state(ss["items"], ss["rules"], ss["vehicles"], changed_av, extra)
     if enc == ss.get("saved_state"):
         return
     ss["saved_state"] = enc

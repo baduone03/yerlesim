@@ -37,6 +37,7 @@ from .constraints import (
     segregation_conflict_mask,
     zone_arrays,
 )
+from .container import shipper_split_notes
 from .models import (
     LDM_REFERENCE_WIDTH_CM,
     CargoItem,
@@ -71,7 +72,9 @@ def _st(name: str) -> Strategy:
 # karşılaştırılarak seçildi: "normal" set, tam aramaya göre toplam 1 yük fazla
 # dışarıda bırakırken 4 kat hızlıdır. ("duvar": kabinden kapıya duvar örme,
 # "serit": boyuna şeritler; kalabalık listelerde şerit belirgin daha iyi.)
-SCREEN_SET = ("hacim/uzun/duvar", "yukseklik/uzun/serit")
+# Ön eleme setinde iki yönelim tercihi de bulunmalı: 20' konteynerde Euro palet "uzun" yönelimle 9,
+# "ince" yönelimle 11 adet sığar (ölçüldü).
+SCREEN_SET = ("hacim/uzun/duvar", "yukseklik/uzun/serit", "taban/ince/duvar")
 NORMAL_SET = ("hacim/uzun/duvar", "taban/ince/duvar", "yukseklik/ince/duvar", "agirlik/uzun/serit")
 
 
@@ -224,6 +227,8 @@ class _Packer:
                     s = self.placed[j]
                     if not s.item.supports_load:
                         return False, "istif", []
+                    if self.rules.keep_shipper_together and s.item.shipper_key != item.shipper_key:
+                        return False, "istif", []
                     if abs(self.ranks[j] - rank) > EPS:
                         if not self.rules.allow_mixed_stop_stacking or is_bad_blocker(rank, self.ranks[j], self.rules.mode):
                             return False, "istif", []
@@ -333,6 +338,8 @@ class _Packer:
             if self.rules.allow_mixed_stop_stacking and self.rules.mode != "FIFO":
                 same |= self.ranks > rank + EPS  # yeni yük daha önce iner: üstte durabilir
             eligible &= same
+            if self.rules.keep_shipper_together:
+                eligible &= np.array([p.item.shipper_key == item.shipper_key for p in self.placed], dtype=bool)
         # Aday noktalar öncelik sırasıyla parça parça işlenir; iyi konum genellikle
         # ilk parçalarda bulunduğundan bütün noktaları süzmek gerekmez.
         CHUNK = 128
@@ -418,7 +425,7 @@ class _Packer:
         assert idx == len(self.boxes) - 1
 
 
-def _sort_key(strategy: Strategy, mode: str):
+def _sort_key(strategy: Strategy, mode: str, keep_shipper: bool = False):
     def key(u: CargoUnit):
         it = u.item
         r = unload_rank(it, mode)
@@ -431,7 +438,9 @@ def _sort_key(strategy: Strategy, mode: str):
             s = (-(it.length * it.width), -it.height)
         else:
             s = (-it.height, -(it.length * it.width))
-        return (-r, base, *s, it.code, u.index)
+        # LCL: aynı göndericinin yükleri arka arkaya yerleşsin (blok oluşsun).
+        shipper = it.shipper_key if keep_shipper else ""
+        return (-r, shipper, base, *s, it.code, u.index)
     return key
 
 
@@ -444,7 +453,7 @@ def pack_vehicle(vehicle: Vehicle, units: list[CargoUnit], rules: Rules, strateg
     pk = _Packer(vehicle, rules, strategy)
     unplaced: list[tuple[CargoUnit, str]] = []
     fail_cache: dict[tuple[str, int], str] = {}
-    for u in sorted(units, key=_sort_key(strategy, rules.mode)):
+    for u in sorted(units, key=_sort_key(strategy, rules.mode, rules.keep_shipper_together)):
         it = u.item
         ok, why = fits_empty(vehicle, it)
         if not ok:
@@ -625,7 +634,7 @@ def _finish_fleet(fleet: FleetPlan, units: list[CargoUnit], rules: Rules) -> Fle
             center_partial_load(p, rules)
         # Seçilen planlar için okunur (tek tek) yükleme sırası hesaplanır.
         finalize_plan(p, rules, detailed_sequence=True)
-    fleet.notes = split_stop_notes(fleet)
+    fleet.notes = split_stop_notes(fleet) + shipper_split_notes(fleet)
     fleet.metrics = fleet_metrics(fleet, units)
     return fleet
 
@@ -727,9 +736,15 @@ def fleet_metrics(fleet: FleetPlan, units: list[CargoUnit]) -> dict:
     }
 
 
+def _unneeded_reefers(fleet: FleetPlan) -> int:
+    """Soğuk zincir yükü taşımayan frigorifik araç/reefer konteyner sayısı (gereksiz pahalı seçim)."""
+    return sum(1 for p in fleet.plans
+               if p.vehicle.refrigerated and p.placements and not any(q.item.cold_chain for q in p.placements))
+
+
 def fleet_score(fleet: FleetPlan, objective: str) -> tuple:
     m = fleet.metrics
-    cap = round(m["capacity_volume_m3"], 1)
+    cap = (_unneeded_reefers(fleet), round(m["capacity_volume_m3"], 1))
     cost = m["total_cost"] if m["total_cost"] is not None else math.inf
     base = (m["unplaced_count"], m["error_count"])
     if objective == "min_maliyet":
@@ -800,12 +815,16 @@ def plan_mixed_fleet(vehicles: list[Vehicle], availability: dict[str, int], item
         if not cands:
             break
         complete = [c for c in cands if c[1]]
+        any_cold = any(u.item.cold_chain for u in remaining)
+        # Soğuk yük kalmadıysa frigorifik araç/reefer en son tercih edilir.
+        waste = (lambda c: int(c[0].refrigerated and not any_cold))
         if complete:
-            key = (lambda c: (c[3], c[0].total_volume_cm3)) if use_cost else (lambda c: (c[0].total_volume_cm3,))
+            key = (lambda c: (c[3], waste(c), c[0].total_volume_cm3)) if use_cost else \
+                  (lambda c: (waste(c), c[0].total_volume_cm3))
             chosen = min(complete, key=key)[0]
         else:
-            key = (lambda c: (-c[2] / max(c[3], 1e-9), c[0].total_volume_cm3)) if use_cost else \
-                  (lambda c: (-round(c[2], 3), c[0].total_volume_cm3))
+            key = (lambda c: (-c[2] / max(c[3], 1e-9), waste(c), c[0].total_volume_cm3)) if use_cost else \
+                  (lambda c: (waste(c), -round(c[2], 3), c[0].total_volume_cm3))
             chosen = min(cands, key=key)[0]
         plans, rest = plan_unit(chosen, remaining, rules, full, objective, False, unit_no + 1)
         if not any(p.placements for p in plans):
@@ -891,8 +910,8 @@ def fmt_num(x: float, digits: int = 0) -> str:
     return s.replace(",", "§").replace(".", ",").replace("§", ".")
 
 
-def _cost_text(m: dict) -> str:
-    return f"{fmt_num(m['total_cost'])} TL" if m.get("total_cost") is not None else "girilmedi"
+def _cost_text(m: dict, unit: str = " TL") -> str:
+    return f"{fmt_num(m['total_cost'])}{unit}" if m.get("total_cost") is not None else "girilmedi"
 
 
 def explain_choice(fleets: list[FleetPlan], objective: str) -> str:
@@ -908,8 +927,10 @@ def explain_choice(fleets: list[FleetPlan], objective: str) -> str:
                      "bu seçenek en az yerleşmeyen yükü bırakıyor.")
     parts.append(f"Hacim kullanımı %{100 * m['volume_util']:.0f}, ağırlık kapasitesi kullanımı %{100 * m['weight_util']:.0f}, "
                  f"yükleme metresi {fmt_num(m['ldm'], 1)} LDM.")
+    cont = any(p.vehicle.is_container for p in best.plans)
+    unit = "" if cont else " TL"
     if m.get("total_cost") is not None:
-        parts.append(f"Sefer maliyeti: {_cost_text(m)}.")
+        parts.append(f"{'Navlun toplamı' if cont else 'Sefer maliyeti'}: {_cost_text(m, unit)}.")
     elif objective == "min_maliyet":
         parts.append("Bazı araçların sefer maliyeti girilmediği için maliyete göre sıralama yapılamadı; "
                      "araç sayısı ve kapasiteye göre sıralandı.")
@@ -922,7 +943,7 @@ def explain_choice(fleets: list[FleetPlan], objective: str) -> str:
         o = others[0]
         alt = f"En yakın alternatif: {o.label} (hacim %{100 * o.metrics['volume_util']:.0f}"
         if o.metrics.get("total_cost") is not None:
-            alt += f", {_cost_text(o.metrics)}"
+            alt += f", {_cost_text(o.metrics, unit)}"
         parts.append(alt + ").")
     if any(p.vehicle.is_demo for p in best.plans):
         parts.append("Not: araç ölçüleri DEMO değerdir; gerçek araç verisiyle doğrulayın.")

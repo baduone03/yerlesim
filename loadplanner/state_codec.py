@@ -44,14 +44,27 @@ def _vehicle_from_dict(d: dict) -> Vehicle:
 
 
 def encode_state(items: list[CargoItem], rules: Rules, vehicles: dict[str, Vehicle],
-                 availability: Optional[dict[str, int]] = None) -> str:
+                 availability: Optional[dict[str, int]] = None, extra: Optional[dict] = None) -> str:
     defaults = default_vehicles()
     changed = {k: asdict(v) for k, v in vehicles.items() if k not in defaults or v != defaults[k]}
     payload = {"v": VERSION, "i": [asdict(i) for i in items], "r": asdict(rules), "vh": changed}
     if availability:
         payload["fa"] = availability
+    if extra:
+        payload["x"] = extra  # arayüz tercihleri (taşıma şekli, LCL tarifesi)
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=_plain).encode("utf-8")
     return base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii").rstrip("=")
+
+
+def decode_extra(text: str) -> dict:
+    """Arayüz tercihlerini okur; yoksa veya bozuksa boş sözlük."""
+    try:
+        pad = "=" * (-len(text) % 4)
+        payload = json.loads(zlib.decompress(base64.urlsafe_b64decode(text + pad)).decode("utf-8"))
+        extra = payload.get("x", {})
+        return extra if isinstance(extra, dict) else {}
+    except (ValueError, zlib.error, json.JSONDecodeError):
+        return {}
 
 
 def decode_state(text: str) -> tuple[list[CargoItem], Rules, dict[str, Vehicle], dict[str, int]]:

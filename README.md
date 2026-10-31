@@ -84,7 +84,7 @@ Ayırıcı `;` veya `,`; ondalık virgül desteklenir; UTF-8 veya Windows-1254 k
 Zorunlu sütunlar: `kod, adet, boy_cm, en_cm, yukseklik_cm, birim_agirlik_kg`.
 İsteğe bağlı: `ad, tip (palet/koli/sandik/makine/rulo/ozel), palet_dahil, ustune_yuk_konabilir,
 ust_azami_yuk_kg, dondurulebilir, yan_yatirilabilir, kirilabilir, istiflenebilir, teslimat_sirasi,
-yukleme_onceligi, notlar, ayrim_grubu, soguk_zincir`. Evet/hayır alanları `evet/hayır`, `1/0`, `true/false` kabul eder.
+yukleme_onceligi, notlar, ayrim_grubu, soguk_zincir, gonderici`. Evet/hayır alanları `evet/hayır`, `1/0`, `true/false` kabul eder.
 Hatalı satırlar satır numarasıyla raporlanır.
 
 ## Koordinat sistemi
@@ -152,10 +152,29 @@ Her yerleşmeyen yük kapsamıyla raporlanır:
 | Kapalı (kutu) dorse 13,60 m | arka kapı |
 | Frigorifik dorse 13,40 m | arka kapı, soğuk zincir |
 | Kamyon + römork (2 × 7,7 m) | iki kasa tek araç; kamyon kasası yalnız yandan, römork arka + yan |
+| 20' DC, 40' DC, 40' HC, 45' HC konteyner | arka kapı (DC 234×228, HC 234×258 cm açıklık); dara ve azami brüt ile |
+| 20' / 40' HC reefer konteyner | arka kapı, soğuk zincir |
 | Özel araç | kullanıcı tanımlı |
 
 Gerçek kullanımda aracın iç ölçüleri, ruhsattaki istiap haddi ve aks bilgisi girilmelidir. Demo
 profillerde aks yük limitleri ve sefer maliyetleri boştur.
+
+## Konteyner taşımacılığı (FCL / LCL)
+
+Optimizasyon sekmesinin başındaki **Taşıma şekli** seçimiyle karayolu araçları ile konteynerler ayrı
+değerlendirilir (araç sekmesinde de "Göster: Konteynerler").
+
+- **FCL (komple):** yükler için en uygun konteyner tipi ve adedi seçilir; konteyner başı navlun girilirse
+  "Minimum maliyet" ile karşılaştırılır, gerekirse farklı tipler birlikte (ör. 1 × 40' HC + 1 × 20' DC)
+  önerilir. Soğuk zincir yükü yoksa reefer konteyner önerilmez.
+- **LCL (parsiyel / konsolidasyon):** yüklere **Gönderici** girilir (LCL seçiliyken formda ana alandadır;
+  CSV sütunu `gonderici`). LCL'ye geçince "Aynı göndericinin yükleri bir arada" kuralı açılır: farklı
+  göndericilerin yükleri üst üste konmaz, aynı göndericininkiler arka arkaya yüklenir. Göndericiye göre
+  adet, ağırlık, m³, **W/M = max(m³, ton)** (asgari W/M ile) ve ücret dökümü verilir; birden fazla
+  konteynere bölünen gönderici bildirilir.
+- **VGM ön hesabı:** her konteyner için dara + yük = brüt ağırlık ve CSC azami brüt ile karşılaştırma.
+  İstif/sabitleme malzemesi dahil değildir; resmi VGM SOLAS'a göre tartımla veya Yöntem 2 ile beyan edilir.
+- Rapor, PDF (VGM satırı, LCL dökümü) ve CSV (LCL dökümü, VGM) çıktılarında yer alır.
 
 ## Lojistik kontroller
 
@@ -201,6 +220,7 @@ loadplanner/
   manual.py                 Elle düzenleme işlemleri ve yeniden doğrulama
   pdf_report.py             Yükleme talimatı PDF'i (fpdf2)
   state_codec.py            Girdilerin sayfa adresinde saklanması
+  container.py              VGM ön hesabı ve LCL gönderici (W/M) dökümü
 assets/fonts/               PDF için DejaVu Sans (Türkçe karakter desteği; lisansı klasörde)
 examples/ornek_yukler.csv   Örnek yük listesi
 tests/                      pytest testleri (algoritma, lojistik kurallar, CSV, PDF, arayüz)

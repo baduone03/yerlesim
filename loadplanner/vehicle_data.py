@@ -59,9 +59,32 @@ def _profiles() -> list[Vehicle]:
                       axles=AxleConfig(front_x=150, rear_x=600, front_label="Römork ön aks", rear_label="Römork arka aks")),
            notes=_DEMO_NOTE + " Römork bağlıyken kamyon kasasının arka kapısı kullanılamaz; kamyon kasası "
                               "yalnız yanlardan (tente) yüklenir/boşaltılır. Toplam istiap ~24 t."),
+        *_containers(),
         Vehicle(id="ozel", name="Özel araç (kullanıcı tanımlı)", category="Kullanıcı tanımlı",
                 length=400, width=200, height=200, max_payload_kg=2000, doors=[Door("arka")],
                 is_demo=False, notes="Ölçüleri ve kapasiteyi kendi aracınıza göre girin."),
+    ]
+
+
+_CONTAINER_NOTE = ("DEMO değer - konteynerin CSC plakasındaki dara ve azami brüt ağırlık ile hat/kiralama "
+                   "şirketinin iç ölçüleri esas alınmalıdır. Karayolu taşımasında ayrıca araç ve aks sınırları geçerlidir.")
+
+
+def _container(id, name, L, W, H, door_w, door_h, tare, max_gross, reefer=False) -> Vehicle:
+    return Vehicle(id=id, name=name, category="Deniz konteyneri", length=L, width=W, height=H,
+                   max_payload_kg=max_gross - tare, doors=[Door("arka", width=door_w, height=door_h)],
+                   body_type="frigorifik" if reefer else "kapali", is_container=True,
+                   tare_kg=tare, max_gross_kg=max_gross, notes=_CONTAINER_NOTE)
+
+
+def _containers() -> list[Vehicle]:
+    return [
+        _container("k20dc", "20' DC konteyner", 589, 235, 239, 234, 228, 2200, 30480),
+        _container("k40dc", "40' DC konteyner", 1203, 235, 239, 234, 228, 3750, 30480),
+        _container("k40hc", "40' HC konteyner", 1203, 235, 269, 234, 258, 3900, 30480),
+        _container("k45hc", "45' HC konteyner", 1355, 235, 269, 234, 258, 4800, 32500),
+        _container("k20rf", "20' reefer konteyner", 544, 229, 227, 229, 226, 3000, 30480, reefer=True),
+        _container("k40rf", "40' reefer (HC) konteyner", 1158, 229, 255, 229, 250, 4600, 34000, reefer=True),
     ]
 
 

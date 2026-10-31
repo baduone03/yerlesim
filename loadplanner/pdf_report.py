@@ -17,6 +17,7 @@ from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 
 from .models import CARGO_TYPES, FleetPlan, Rules, VehiclePlan, access_text
+from .container import lcl_breakdown
 from .optimizer import fmt_num
 from .visualization import OTHER, color_map
 
@@ -152,6 +153,12 @@ def _vehicle_section(pdf: _Doc, plan: VehiclePlan, total: int, rules: Rules, man
     pdf.para(f"Yük: {m['placed_count']} adet, {fmt_num(m['placed_weight_kg'])} kg  |  Hacim kullanımı "
              f"%{100 * m['volume_util']:.0f}  |  Ağırlık kullanımı %{100 * m['weight_util']:.0f}  |  "
              f"Kullanılan boy {m['used_length_cm']:.0f} cm  |  {fmt_num(m.get('ldm', 0.0), 1)} LDM")
+    if v.is_container and v.tare_kg is not None:
+        gross = v.tare_kg + m["placed_weight_kg"]
+        lim = f" / azami {fmt_num(v.max_gross_kg)} kg" if v.max_gross_kg else ""
+        pdf.para(f"VGM ön hesap: dara {fmt_num(v.tare_kg)} + yük {fmt_num(m['placed_weight_kg'])} = "
+                 f"{fmt_num(gross)} kg brüt{lim} (istif/sabitleme malzemesi hariç; resmi VGM tartım veya "
+                 "SOLAS Yöntem 2 ile beyan edilir)", bold=True)
     if manual_edits:
         pdf.para(f"Not: Bu plan elle düzenlendi ({manual_edits} değişiklik) ve yeniden kontrol edildi.", bold=True)
     pdf.ln(1)
@@ -239,7 +246,9 @@ def _vehicle_section(pdf: _Doc, plan: VehiclePlan, total: int, rules: Rules, man
         pdf.para(f"Kural: {rules.mode}. Liste boşaltma adımı sırasındadır.", size=7)
 
 
-def build_loading_pdf(fleet: FleetPlan, rules: Rules, title: Optional[str] = None) -> bytes:
+def build_loading_pdf(fleet: FleetPlan, rules: Rules, title: Optional[str] = None,
+                      lcl: Optional[dict] = None) -> bytes:
+    """``lcl`` verilirse (items, rate, min_wm, currency anahtarlarıyla) gönderici dökümü eklenir."""
     stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
     doc_title = title or f"LoadPlanner TR - {fleet.label} - {stamp}"
     pdf = _Doc(doc_title)
@@ -251,6 +260,22 @@ def build_loading_pdf(fleet: FleetPlan, rules: Rules, title: Optional[str] = Non
     if not fleet.plans:
         pdf.add_page()
         pdf.h1("Yükleme Talimatı")
+    if lcl is not None:
+        rows = lcl_breakdown(lcl["items"], fleet, lcl.get("rate"), lcl.get("min_wm", 1.0))
+        cur = lcl.get("currency", "")
+        pdf.h2("LCL gönderici dökümü (W/M)")
+        pdf.para("Ücrete esas miktar = max(hacim m³, ağırlık ton), en az "
+                 f"{fmt_num(lcl.get('min_wm', 1.0), 1)} W/M.", size=7)
+        pdf.set_font("DejaVu", "", 7)
+        pdf.set_fill_color(255, 255, 255)
+        with pdf.table(col_widths=(40, 14, 22, 18, 18, 26, 48), line_height=4,
+                       headings_style=FontFace(emphasis="BOLD", fill_color=(236, 236, 232)),
+                       first_row_as_headings=True) as table:
+            table.row(["Gönderici", "Adet", "Ağırlık kg", "m³", "W/M", f"Ücret {cur}".strip(), "Konteyner"])
+            for r in rows:
+                table.row([r.shipper, str(r.units), fmt_num(r.weight_kg), fmt_num(r.cbm, 2), fmt_num(r.wm, 2),
+                           fmt_num(r.charge, 2) if r.charge is not None else "-",
+                           r.containers + (f" ({r.unplaced} yerleşmedi)" if r.unplaced else "")])
     if fleet.notes:
         pdf.h2("Filo notları")
         pdf.para("\n".join(f"• {x}" for x in fleet.notes))
